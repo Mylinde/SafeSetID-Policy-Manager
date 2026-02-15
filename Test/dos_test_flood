@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Simple Denial‑of‑Service flood tester for safesetid monitor.
+# WARNING: run only on test systems or with care. Do NOT modify /etc/passwd.
+# Usage:
+#   sudo ./dos_test_flood.sh [-d duration_seconds] [-p writers] [-i interval] [--group] [--stop]
+#
+set -euo pipefail
+
+DURATION=30
+PARALLEL=2
+INTERVAL=0.2
+USE_GROUP=0
+PIDFILE="/var/run/dos_test_flood.pids"
+FILES=(/etc/safesetid/*)
+
+print_usage() {
+  cat <<USAGE
+dos_test_flood.sh - simple tester to simulate frequent file changes.
+
+Options:
+  -d <seconds>    Duration to run the flood (default: ${DURATION})
+  -p <writers>    Number of parallel writer processes (default: ${PARALLEL})
+  -i <interval>   Interval between writes per writer in seconds (float, default: ${INTERVAL})
+  --group         Also touch /etc/group (use with extreme care)
+  --stop          Stop running flood writers (reads PIDFILE=${PIDFILE})
+  -h | --help     Show this help
+USAGE
+}
+
+if [ "$#" -gt 0 ]; then
+  # simple args parser
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -d) DURATION="$2"; shift 2 ;;
+      -p) PARALLEL="$2"; shift 2 ;;
+      -i) INTERVAL="$2"; shift 2 ;;
+      --group) USE_GROUP=1; shift ;;
+      --stop) ACTION="stop"; shift ;;
+      -h|--help) print_usage; exit 0 ;;
+      *) echo "Unknown arg: $1"; print_usage; exit 2 ;;
+    esac
+  done
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This script must be run as root (to write /etc/safesetid/*). Use sudo." >&2
+  exit 1
+fi
+
+if [ "${ACTION:-run}" = "stop" ]; then
+  if [ -f "${PIDFILE}" ]; then
+    echo "Stopping flood writers (pids in ${PIDFILE})..."
+    while read -r pid; do
+      [ -n "$pid" ] || continue
+      if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+      fi
+    done < "${PIDFILE}" || true
+    rm -f "${PIDFILE}" || true
+    echo "Stopped."
+    exit 0
+  else
+    echo "No PID file (${PIDFILE}) found."
+    exit 1
+  fi
+fi
+
+if [ "${USE_GROUP}" -eq 1 ]; then
+  FILES+=(/etc/group)
+  echo "WARNING: /etc/group will be modified during test. Ensure this is acceptable."
+fi
+
+# ensure files exist (create if missing) with safe permissions
+for f in "${FILES[@]}"; do
+  dir=$(dirname "$f")
+  mkdir -p "$dir" 2>/dev/null || true
+  touch "$f" 2>/dev/null || true
+  chown root:root "$f" 2>/dev/null || true
+  chmod 600 "$f" 2>/dev/null || true
+done
+
+# worker function
+_writer_main() {
+  local id="$1"
+  local interval="$2"
+  local files=("${!3}")
+  # loop writing timestamp + id + random to files
+  while true; do
+    local t ts rand s
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    rand="$(head -c 6 /dev/urandom | od -A n -t x1 2>/dev/null | tr -d ' \n')"
+    s="${ts} flood-w${id} r=${rand}"
+    for f in "${files[@]}"; do
+      # atomic write: write to tmp and move
+      tmp="$(mktemp "${f}.tmp.XXXXXX" 2>/dev/null || true)"
+      if [ -n "$tmp" ]; then
+        printf '%s\n' "$s" > "$tmp" 2>/dev/null || true
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$f" 2>/dev/null || true
+      else
+        # fallback append to file (less atomic)
+        printf '%s\n' "$s" >> "$f" 2>/dev/null || true
+      fi
+    done
+    sleep "$interval"
+  done
+}
+
+# spawn writers
+echo "Starting ${PARALLEL} writer(s) for ${DURATION}s, interval=${INTERVAL}s, files=${FILES[*]}"
+rm -f "${PIDFILE}" || true
+pids=()
+for i in $(seq 1 "$PARALLEL"); do
+  # pass array by name: use indirect expansion
+  _writer_main "$i" "$INTERVAL" FILES[@] &
+  p=$!
+  echo "$p" >> "${PIDFILE}"
+  pids+=("$p")
+  echo "spawned writer pid $p"
+done
+
+# wait for duration, then stop
+SECONDS=0
+while [ "$SECONDS" -lt "$DURATION" ]; do
+  sleep 1
+done
+
+echo "Duration expired: killing writers..."
+for p in "${pids[@]}"; do
+  if kill -0 "$p" 2>/dev/null; then
+    kill "$p" 2>/dev/null || true
+    sleep 0.5
+    if kill -0 "$p" 2>/dev/null; then
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  fi
+done
+
+rm -f "${PIDFILE}" || true
+echo "Done. Check safesetid logs: journalctl -f -t safesetid -n 200 --no-pager"
+exit 0

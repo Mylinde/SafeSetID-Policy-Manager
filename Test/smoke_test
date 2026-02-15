@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+ROOT="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/.." && pwd)"
+SCRIPT="${ROOT}/safesetid"
+WRAPPER="/usr/local/bin/safesetid-wrapper"
+BACKUP_DIR="/var/lib/safesetid"
+TIMEOUT_CMD="$(command -v timeout || true)"
+SUDO_CMD="$(command -v sudo || true)"
+
+_report() {
+  local level="$1"; shift
+  printf '%s: %s\n' "$level" "$*"
+}
+
+_run_as_root() {
+  # run command string as root (via sudo if needed)
+  if [ "$(id -u)" -eq 0 ]; then
+    bash -c "$*"
+  else
+    if [ -n "${SUDO_CMD}" ]; then
+      "${SUDO_CMD}" bash -c "$*"
+    else
+      _report WARN "Not root and sudo not available; attempting without elevation"
+      bash -c "$*"
+    fi
+  fi
+}
+
+# Basic prechecks
+if [ ! -f "${SCRIPT}" ]; then
+  _report ERROR "safesetid script not found at ${SCRIPT}"
+  exit 2
+fi
+
+_report INFO "Starting SafeSetID smoke tests"
+
+# 1) Syntax check
+if bash -n "${SCRIPT}"; then
+  _report OK "bash -n: syntax OK"
+else
+  _report FAIL "bash -n failed"
+  exit 3
+fi
+
+# 2) ShellCheck (optional)
+if command -v shellcheck >/dev/null 2>&1; then
+  if shellcheck -s bash "${SCRIPT}"; then
+    _report OK "shellcheck: no issues"
+  else
+    _report WARN "shellcheck reported issues (see output)"
+  fi
+else
+  _report INFO "shellcheck not installed; skipping"
+fi
+
+# 3) Wrapper verify (non-destructive)
+if [ -x "${WRAPPER}" ]; then
+  _report INFO "Running wrapper verify (timeout 30s)"
+  if [ -n "${TIMEOUT_CMD}" ]; then
+    if _run_as_root "${TIMEOUT_CMD} 30 ${WRAPPER} verify"; then
+      _report OK "wrapper verify succeeded"
+    else
+      _report WARN "wrapper verify returned non-zero or timed out"
+    fi
+  else
+    if _run_as_root "${WRAPPER} verify"; then
+      _report OK "wrapper verify succeeded"
+    else
+      _report WARN "wrapper verify returned non-zero"
+    fi
+  fi
+else
+  _report INFO "wrapper not installed at ${WRAPPER}; skipping wrapper verify"
+fi
+
+# 4) check_function (non-interactive)
+if [ -x "${WRAPPER}" ]; then
+  _report INFO "Running wrapper check_function (timeout 20s)"
+  if [ -n "${TIMEOUT_CMD}" ]; then
+    if _run_as_root "${TIMEOUT_CMD} 20 ${WRAPPER} check_function"; then
+      _report OK "wrapper check_function succeeded"
+    else
+      _report WARN "wrapper check_function returned non-zero or timed out"
+    fi
+  else
+    if _run_as_root "${WRAPPER} check_function"; then
+      _report OK "wrapper check_function succeeded"
+    else
+      _report WARN "wrapper check_function returned non-zero"
+    fi
+  fi
+else
+  _report INFO "wrapper missing; attempting to run main script 'verify' directly"
+  if bash -n "${SCRIPT}" && _run_as_root "${SCRIPT} verify"; then
+    _report OK "script verify succeeded"
+  else
+    _report WARN "script verify failed or wrapper missing"
+  fi
+fi
+
+# 5) Concurrent lock behavior test (background verify + quick check_function)
+if [ -x "${WRAPPER}" ] && [ -n "${TIMEOUT_CMD}" ]; then
+  _report INFO "Starting concurrent-lock test (background verify + quick check_function)"
+  # start background long running verify (best-effort)
+  _run_as_root "${TIMEOUT_CMD} 60 ${WRAPPER} verify" >/dev/null 2>&1 &
+  BG_PID=$!
+  sleep 0.6
+  START=$(date +%s)
+  if _run_as_root "${TIMEOUT_CMD} 12 ${WRAPPER} check_function" >/dev/null 2>&1; then
+    :
+  fi
+  END=$(date +%s)
+  DUR=$((END-START))
+  # cleanup bg
+  kill -0 "${BG_PID}" >/dev/null 2>&1 && kill "${BG_PID}" >/dev/null 2>&1 || true
+  if [ "${DUR}" -lt 9 ]; then
+    _report OK "Concurrent-lock: check_function returned promptly (DUR=${DUR}s)"
+  else
+    _report WARN "Concurrent-lock: check_function took long (DUR=${DUR}s) — inspect locking behavior"
+  fi
+else
+  _report INFO "Skipping concurrent-lock test (requires wrapper + timeout)"
+fi
+
+# 6) Datastore artefacts check
+_needed_files=(
+  "${BACKUP_DIR}/datastore.sha256"
+  "${BACKUP_DIR}/safesetid.sha256"
+  "${BACKUP_DIR}/safesetid.bak"
+  "${BACKUP_DIR}/safesetid-wrapper.bak"
+  "${BACKUP_DIR}/.uid"
+  "${BACKUP_DIR}/.gid"
+)
+for f in "${_needed_files[@]}"; do
+  if [ -f "${f}" ]; then
+    _report OK "Found ${f}"
+  else
+    _report WARN "Missing ${f} (may be normal if not yet installed)"
+  fi
+done
+
+# 7) Systemd health checks (units + status + journal for failures)
+_systemd_health() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    _report INFO "systemctl not available; skipping systemd health checks"
+    return 0
+  fi
+
+  local units=( \
+    "safesetid.service" \
+    "var-tmp-safesetid.mount" \
+    "safesetid-wrapper-restore.path" \
+    "safesetid-wrapper-restore.service" \
+    "safesetid-monitor.path" \
+    "safesetid-file-monitor.path" \
+    "safesetid-monitor.service" \
+    "safesetid-file-monitor.service" \
+  )
+
+  local unit state enabled rc=0 unit_file utype result exec_status path_unit path_state path_enabled
+  for unit in "${units[@]}"; do
+    state="$(systemctl is-active "${unit}" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
+    utype="$(systemctl show -p Type --value "${unit}" 2>/dev/null || true)"
+    result="$(systemctl show -p Result --value "${unit}" 2>/dev/null || true)"
+    exec_status="$(systemctl show -p ExecMainStatus --value "${unit}" 2>/dev/null || true)"
+
+    # Service durch Path getriggert?
+    case "${unit}" in
+      safesetid-wrapper-restore.service) path_unit="safesetid-wrapper-restore.path" ;;
+      safesetid-monitor.service)         path_unit="safesetid-monitor.path" ;;
+      safesetid-file-monitor.service)    path_unit="safesetid-file-monitor.path" ;;
+      *)                                 path_unit="" ;;
+    esac
+
+    if [ -n "${path_unit}" ]; then
+      path_state="$(systemctl is-active "${path_unit}" 2>/dev/null || true)"
+      path_enabled="$(systemctl is-enabled "${path_unit}" 2>/dev/null || true)"
+      # Bewertung: OK, wenn Path-Unit vorhanden und enabled/static ist; Service darf inactive/static/oneshot sein
+      if [ "${path_enabled}" = "enabled" ] || [ "${path_enabled}" = "static" ]; then
+        _report OK "systemd: ${unit} (triggered by ${path_unit}) service_state=${state} service_enabled=${enabled} path_state=${path_state} path_enabled=${path_enabled}"
+      else
+        _report WARN "systemd: ${unit} (triggered by ${path_unit}) path_enabled=${path_enabled} — enable ${path_unit}"
+      fi
+      # Fehlerjournal nur bei tatsächlichem Failure des Service
+      if [ "${state}" = "failed" ]; then
+        _report ERR "systemd: ${unit} is in failed state — recent journal:"
+        if command -v journalctl >/dev/null 2>&1; then
+          journalctl -u "${unit}" -n 40 --no-pager 2>/dev/null | sed -n '1,40p' | while IFS= read -r line; do
+            _report JOURNAL "${line}"
+          done
+        fi
+        rc=1
+      fi
+      # Path-Unit-File vorhanden?
+      unit_file="$(systemctl show -p FragmentPath --value "${path_unit}" 2>/dev/null || true)"
+      if [ -n "${unit_file}" ] && [ ! -f "${unit_file}" ]; then
+        _report WARN "systemd: unit file for ${path_unit} not present at ${unit_file}"
+      fi
+      continue
+    fi
+
+    # Oneshoot korrekt bewerten (safesetid.service)
+    if [ "${utype}" = "oneshot" ]; then
+      if [ "${state}" = "active" ] || [ "${result}" = "success" ] || [ "${exec_status}" = "0" ]; then
+        _report OK "systemd: ${unit} (type=oneshot) state=${state} result=${result} exec_status=${exec_status} enabled=${enabled}"
+      else
+        _report WARN "systemd: ${unit} (type=oneshot) state=${state} result=${result} exec_status=${exec_status} enabled=${enabled}"
+      fi
+    else
+      if [ "${state}" = "active" ] || [ "${state}" = "mounted" ]; then
+        _report OK "systemd: ${unit} state=${state} enabled=${enabled}"
+      else
+        _report WARN "systemd: ${unit} state=${state} enabled=${enabled}"
+      fi
+    fi
+
+    if [ "${state}" = "failed" ]; then
+      _report ERR "systemd: ${unit} is in failed state — recent journal:"
+      if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u "${unit}" -n 40 --no-pager 2>/dev/null | sed -n '1,40p' | while IFS= read -r line; do
+          _report JOURNAL "${line}"
+        done
+      fi
+      rc=1
+    fi
+
+    unit_file="$(systemctl show -p FragmentPath --value "${unit}" 2>/dev/null || true)"
+    if [ -n "${unit_file}" ] && [ ! -f "${unit_file}" ]; then
+      _report WARN "systemd: unit file for ${unit} not present at ${unit_file}"
+    fi
+  done
+
+  return ${rc}
+}
+
+_report INFO "Running systemd health checks"
+if _systemd_health; then
+  _report OK "systemd health checks passed"
+else
+  _report WARN "systemd health checks reported issues"
+fi
+
+# 7b) Optional: Path-Trigger durch Dateiänderung (touch) von /etc/passwd und /etc/group
+# Hinweis: setzt Root voraus; nicht-destruktiv (TIMESTAMP-Update), kann dennoch Services starten.
+if [ "$(id -u)" -eq 0 ]; then
+  _report INFO "Triggering path units via touch on /etc/passwd and /etc/group"
+  if touch /etc/passwd /etc/group 2>/dev/null; then
+    # kurze Wartezeit, damit die oneshot-Services laufen können
+    sleep 1
+    # Journale der getriggerten Services prüfen
+    if command -v journalctl >/dev/null 2>&1; then
+      _report INFO "Recent journal (safesetid-monitor.service)"
+      journalctl -u safesetid-monitor.service -n 20 --no-pager 2>/dev/null | sed -n '1,20p' | while IFS= read -r line; do
+        _report JOURNAL "${line}"
+      done
+      _report INFO "Recent journal (safesetid-file-monitor.service)"
+      journalctl -u safesetid-file-monitor.service -n 20 --no-pager 2>/dev/null | sed -n '1,20p' | while IFS= read -r line; do
+        _report JOURNAL "${line}"
+      done
+    fi
+    _report OK "Path trigger executed"
+  else
+    _report WARN "Touch on /etc/passwd or /etc/group failed"
+  fi
+else
+  _report INFO "Skipping path trigger (requires root)"
+fi
+
+# 8) Summary & exit
+_report INFO "Smoke tests completed. Inspect WARN/ERR lines above for action items."
+exit 0
