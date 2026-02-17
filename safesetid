@@ -488,7 +488,7 @@ _read_meta() {
 
 # Prune old .bak files:
 # - remove files older than BACKUP_RETENTION_DAYS
-# - ensure only BACKUP_KEEP_PER_FILE newest backups are kept per base (uid_allowlist, gid_allowlist)
+# - ensure only BACKUP_KEEP_PER_FILE newest backups per base (uid_allowlist, gid_allowlist)
 _prune_old_backups() {
 	local base files i prev_nullglob prefixes
 	mkdir -p "${BACKUP_DIR}" 2>/dev/null || true
@@ -559,65 +559,77 @@ _prune_old_backups() {
 	fi
 }
 
-# Preflight & backup check for allowlist target
-# returns 0 on ok, non-zero on fatal (permission) error
-# NOTE: optional second arg skip_bak (1 => do not create a preflight backup; only check permissions)
+# Ersetze die _preflight_and_backup Funktion (Zeilen 448-482):
 _preflight_and_backup() {
-	local target="$1"
-	local skip_bak="${2:-0}"
-	local bak ts
+    local target="$1"
+    local skip_bak="${2:-0}"
+    local bak ts tmp_bak
 
-	mkdir -p "${BACKUP_DIR}"
-	chmod 700 "${BACKUP_DIR}" || true
-	chown root:root "${BACKUP_DIR}" 2>/dev/null || true
+    mkdir -p "${BACKUP_DIR}"
+    chmod 700 "${BACKUP_DIR}" || true
+    chown root:root "${BACKUP_DIR}" 2>/dev/null || true
 
-	# If the target exists, ensure it's owned by root (simple permission check)
-	if [ -e "${target}" ]; then
-		# stat may fail on some pseudo-filesystems, so tolerate stat failures with a warning
-		if stat_out="$(stat -c '%u %a' -- "${target}" 2>/dev/null)"; then
-			target_owner_uid=${stat_out%% *}
-			target_mode=${stat_out##* }
-			if [ "${target_owner_uid}" -ne 0 ]; then
-				_log err "ERROR: ${target} not owned by root (uid=${target_owner_uid}). Aborting to avoid permission issues."
-				return 1
-			fi
-			# we don't require a specific mode because sysfs may present different perms,
-			# but warn if it's world-writable
-			if [ "${target_mode}" -ge 666 ]; then
-				_log warning "WARN: ${target} has permissive mode ${target_mode}"
-			fi
-		else
-			_log warning "WARN: could not stat ${target}; proceeding cautiously"
-		fi
+    # If the target exists, ensure it's owned by root (simple permission check)
+    if [ -e "${target}" ]; then
+        # stat may fail on some pseudo-filesystems, so tolerate stat failures with a warning
+        if stat_out="$(stat -c '%u %a' -- "${target}" 2>/dev/null)"; then
+            target_owner_uid=${stat_out%% *}
+            target_mode=${stat_out##* }
+            if [ "${target_owner_uid}" -ne 0 ]; then
+                _log err "ERROR: ${target} not owned by root (uid=${target_owner_uid}). Aborting to avoid permission issues."
+                return 1
+            fi
+            # we don't require a specific mode because sysfs may present different perms,
+            # but warn if it's world-writable
+            if [ "${target_mode}" -ge 666 ]; then
+                _log warning "WARN: ${target} has permissive mode ${target_mode}"
+            fi
+        else
+            _log warning "WARN: could not stat ${target}; proceeding cautiously"
+        fi
 
-		# Backup current allowlist (if readable) — only if skip_bak != 1
-		if [ "${skip_bak}" -ne 1 ]; then
-			if [ -r "${target}" ]; then
-				ts="$(date -u +%Y%m%dT%H%M%SZ)"
-				bak="${BACKUP_DIR}/$(basename "${target}").bak.${ts}"
-				if cat "${target}" >"${bak}" 2>/dev/null; then
-					chmod 600 "${bak}" 2>/dev/null || true
-					chown root:root "${bak}" 2>/dev/null || true
-					# prune old backups after creating one
-					_prune_old_backups
-				else
-					_log warning "WARN: failed to create backup of ${target}; continuing but consider manual backup"
-				fi
-			else
-				_log warning "WARN: ${target} not readable; cannot create backup"
-			fi
-		fi
-	else
-		# target doesn't exist; check that we can create it by testing write to dir
-		if ! touch "${BACKUP_DIR}/.safesetid_write_test" 2>/dev/null; then
-			_log err "ERROR: cannot write to ${BACKUP_DIR}; aborting"
-			return 1
-		else
-			rm -f "${BACKUP_DIR}/.safesetid_write_test" 2>/dev/null || true
-		fi
-	fi
+        # Backup current allowlist (if readable) — only if skip_bak != 1
+        if [ "${skip_bak}" -ne 1 ]; then
+            if [ -r "${target}" ]; then
+                ts="$(date -u +%Y%m%dT%H%M%SZ)"
+                bak="${BACKUP_DIR}/$(basename "${target}").bak.${ts}"
+                
+                # FIX: Create temp file with secure permissions BEFORE copying
+                tmp_bak="$(mktemp "${BACKUP_DIR}/.backup.XXXXXX")" || {
+                    _log warning "WARN: failed to create temp backup file"
+                    return 0
+                }
+                chmod 600 "${tmp_bak}"
+                chown root:root "${tmp_bak}" 2>/dev/null || true
+                
+                if cat "${target}" >"${tmp_bak}" 2>/dev/null; then
+                    # Atomic move to final backup location
+                    if mv "${tmp_bak}" "${bak}" 2>/dev/null; then
+                        # prune old backups after creating one
+                        _prune_old_backups
+                    else
+                        _log warning "WARN: failed to move backup to ${bak}"
+                        rm -f "${tmp_bak}" 2>/dev/null || true
+                    fi
+                else
+                    _log warning "WARN: failed to create backup of ${target}; continuing but consider manual backup"
+                    rm -f "${tmp_bak}" 2>/dev/null || true
+                fi
+            else
+                _log warning "WARN: ${target} not readable; cannot create backup"
+            fi
+        fi
+    else
+        # target doesn't exist; check that we can create it by testing write to dir
+        if ! touch "${BACKUP_DIR}/.safesetid_write_test" 2>/dev/null; then
+            _log err "ERROR: cannot write to ${BACKUP_DIR}; aborting"
+            return 1
+        else
+            rm -f "${BACKUP_DIR}/.safesetid_write_test" 2>/dev/null || true
+        fi
+    fi
 
-	return 0
+    return 0
 }
 
 # Simplified merge + optional prune
@@ -657,6 +669,13 @@ _update_allowlist() {
 			return 1
 		}
 		chmod 600 "${whitelist}"
+
+		# FIX: Validate whitelist path before using in awk
+		if [[ ! "${whitelist}" =~ ^"${BACKUP_DIR}"/.+ ]]; then
+			_log err "ERROR: Invalid whitelist path generated"
+			rm -f "${tmp}" "${whitelist}"
+			return 1
+		fi
 
 		getent passwd | cut -d: -f3 | sort -u >"${whitelist}" || true
 
@@ -1427,17 +1446,31 @@ check_function() {
 
 # Editor selection helper (used by configure/configure_uid/configure_gid)
 _choose_editor() {
-	local candidate
-	# Prefer user's EDITOR, then search a whitelist, finally fallback to 'editor'
-	for candidate in "${EDITOR:-}" nano micro vim emacs vi editor; do
-		# Skip empty candidates (e.g., if EDITOR is unset)
-		[ -z "${candidate}" ] && continue
-		if command -v "${candidate}" >/dev/null 2>&1; then
-			EDITOR_CMD_ARR=( "${candidate}" )
-			return 0
-		fi
-	done
-	return 1
+    local candidate full_path
+    # Prefer user's EDITOR, then search a whitelist, finally fallback to 'editor'
+    for candidate in "${EDITOR:-}" nano micro vim emacs vi editor; do
+        # Skip empty candidates (e.g., if EDITOR is unset)
+        [ -z "${candidate}" ] && continue
+        
+        # FIX: Validate candidate contains only safe characters
+        if [[ ! "${candidate}" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+            _log warning "WARN: Editor candidate '${candidate}' contains unsafe characters; skipping"
+            continue
+        fi
+        
+        if command -v "${candidate}" >/dev/null 2>&1; then
+            full_path="$(command -v "${candidate}" 2>/dev/null || true)"
+            
+            # FIX: Ensure it's a regular file under standard paths
+            if [ -f "${full_path}" ] && [[ "${full_path}" == /usr/* || "${full_path}" == /bin/* || "${full_path}" == /usr/local/* ]]; then
+                EDITOR_CMD_ARR=( "${full_path}" )
+                return 0
+            else
+                _log warning "WARN: Editor '${candidate}' at '${full_path}' is not in a trusted location; skipping"
+            fi
+        fi
+    done
+    return 1
 }
 
 # open editor on uid config and apply
@@ -1905,13 +1938,38 @@ uninstall_script() {
         return 1
     fi
 
-    # Check if the token (second argument) was provided.
+    # Check if the token (second argument) was provided
     if [ "$#" -lt 2 ]; then
         _log err "ERROR: Missing uninstall token."
         return 1
     fi
 
-    if [ "$2" != "${stored_token}" ]; then
+    # FIX: Validate token format (8-char hex)
+    if [[ ! "$2" =~ ^[0-9a-f]{8}$ ]]; then
+        sleep 1  # Rate-limiting
+        _log err "ERROR: Invalid token format."
+        return 1
+    fi
+
+    # FIX: Constant-time comparison (character by character)
+    local provided_token="$2"
+    local mismatch=0
+    local i
+    
+    # Ensure both tokens are same length
+    if [ "${#provided_token}" -ne "${#stored_token}" ]; then
+        mismatch=1
+    fi
+    
+    # Compare character by character (always complete loop)
+    for ((i=0; i<${#stored_token}; i++)); do
+        if [ "${provided_token:i:1}" != "${stored_token:i:1}" ]; then
+            mismatch=1
+        fi
+    done
+    
+    if [ "${mismatch}" -ne 0 ]; then
+        sleep 1  # Rate-limiting against brute-force
         _log err "ERROR: Invalid uninstall token."
         return 1
     fi
