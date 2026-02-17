@@ -98,7 +98,7 @@ _log() {
 	esac
 
 	# prefer explicit LOG_TTY only if it is a character device under /dev
-	local target_tty="${1-}"
+	local target_tty=""
 	if [ -n "${LOG_TTY:-}" ] && [ -c "${LOG_TTY}" ] && [[ "${LOG_TTY}" == /dev/tty* ]]; then
 		target_tty="${LOG_TTY}"
 	else
@@ -171,20 +171,34 @@ _compute_datastore_hash_tmp() {
 
 # Atomically update the persistent datastore hash file
 _update_datastore_hash() {
-	local tmp
-	mkdir -p "${BACKUP_DIR}"
-	tmp="$(mktemp "${BACKUP_DIR}/.datastore_hash.XXXXXX")" || {
-		_log err "ERROR: cannot create tmp for datastore hash"
-		return 1
-	}
-	_compute_datastore_hash_tmp "${tmp}"
-	mv "${tmp}" "${DATASTORE_HASH_FILE}" 2>/dev/null || {
-		_log err "ERROR: cannot write datastore hash to ${DATASTORE_HASH_FILE}"
-		rm -f "${tmp}" 2>/dev/null || true
-		return 1
-	}
-	chmod 644 "${DATASTORE_HASH_FILE}" 2>/dev/null || true
-	return 0
+    local tmp new_hash old_hash
+    
+    mkdir -p "${BACKUP_DIR}"
+    tmp="$(mktemp "${BACKUP_DIR}/.datastore_hash.XXXXXX")" || {
+        _log err "ERROR: cannot create tmp for datastore hash"
+        return 1
+    }
+    _compute_datastore_hash_tmp "${tmp}"
+    
+    # Store hash before move for verification
+    old_hash="$(sha256sum "${tmp}" 2>/dev/null | awk '{print $1}' || true)"
+    
+    mv "${tmp}" "${DATASTORE_HASH_FILE}" 2>/dev/null || {
+        _log err "ERROR: cannot write datastore hash to ${DATASTORE_HASH_FILE}"
+        rm -f "${tmp}" 2>/dev/null || true
+        return 1
+    }
+    chmod 644 "${DATASTORE_HASH_FILE}" 2>/dev/null || true
+    
+    # Verify hash after write (integrity check)
+    new_hash="$(sha256sum "${DATASTORE_HASH_FILE}" 2>/dev/null | awk '{print $1}' || true)"
+    
+    if [ -n "${new_hash}" ] && [ -n "${old_hash}" ] && [ "${new_hash}" != "${old_hash}" ]; then
+        _log err "ERROR: datastore hash verification failed after write"
+        return 1
+    fi
+    
+    return 0
 }
 
 # Create/refresh private temp store with authoritative copies of protected files
@@ -1136,7 +1150,10 @@ _dos_mitigate() {
 				# Run fuser in a best-effort manner each iteration
 				if command -v fuser >/dev/null 2>&1; then
 					# polite TERM to processes using monitored files; suppress errors
-					fuser -wk -TERM "${monitored_files[@]}" 2>/dev/null || true
+					if [ "${#monitored_files[@]}" -gt 0 ]; then
+                        # Use -- to prevent option injection
+                        fuser -wk -TERM -- "${monitored_files[@]}" 2>/dev/null || true
+                    fi
 				fi
 
 				# compute remaining time and sleep for the smaller of interval or remaining
@@ -1313,6 +1330,7 @@ check_function() {
 			trap - EXIT INT TERM
 			return 0
 		fi
+
     fi
 
 	# ------------------ UID detection ------------------
@@ -1341,6 +1359,11 @@ check_function() {
 		fi
 	else
 		if _update_allowlist "${ALLOWLIST_UID}" "${ALLOWLIST_UID}" "" "" 1; then
+            # Safety: ensure allowlist is never completely empty (should contain at least root:0)
+            if ! grep -q '[^[:space:]]' "${ALLOWLIST_UID}" 2>/dev/null; then
+                _log err "ERROR: UID allowlist is empty after prune; restoring from canonical"
+                _verify_and_restore "${ALLOWLIST_UID}" "${CANON_UID}" "${META_UID}" "UID allowlist"
+            fi
 			eval "exec ${LOCK_FD}>&-"
 			trap - EXIT INT TERM
 			return 0
@@ -1383,6 +1406,11 @@ check_function() {
 		fi
 	else
 		if _update_allowlist "${ALLOWLIST_GID}" "${ALLOWLIST_GID}" "" "" 1; then
+            # Safety: ensure allowlist is never completely empty
+            if ! grep -q '[^[:space:]]' "${ALLOWLIST_GID}" 2>/dev/null; then
+                _log err "ERROR: GID allowlist is empty after prune; restoring from canonical"
+                _verify_and_restore "${ALLOWLIST_GID}" "${CANON_GID}" "${META_GID}" "GID allowlist"
+            fi
 			eval "exec ${LOCK_FD}>&-"
 			trap - EXIT INT TERM
 			return 0
@@ -1614,7 +1642,10 @@ if [ ! -f "${DATA_HASH_FILE}" ]; then
   exit 1
 fi
 
-CURRENT_TMP="$(mktemp)"
+CURRENT_TMP="$(mktemp)" || {
+  logger -t safesetid-wrapper -p auth.crit "Failed to create temp file"
+  exit 1
+}
 _compute_tmp "${CURRENT_TMP}"
 
 if ! cmp -s "${DATA_HASH_FILE}" "${CURRENT_TMP}"; then
@@ -2306,7 +2337,7 @@ case "${1:-}" in
 		_dos_mitigate ;;
 	_dos_check_and_mitigate)
 		_ensure_non_interactive
-		apply_base_policies ;;
+		_dos_check_and_mitigate ;;
 	*)
 		# Always apply base policies
 		apply_base_policies ;;
