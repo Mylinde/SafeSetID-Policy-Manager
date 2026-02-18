@@ -1911,7 +1911,27 @@ install_script() {
     install_monitor
     install_file_monitor
 
-	_log info "!!! Uninstall token generated (store securely): ${UNINSTALL_TOKEN} !!!"	
+cat <<EOF
+
+============================================================
+IMPORTANT: Uninstall Token Generated
+============================================================
+
+	Token: ${UNINSTALL_TOKEN}
+
+⚠️  STORE THIS TOKEN SECURELY ⚠️
+
+You will need this token to uninstall SafeSetID.
+Recommended: Save to password manager (e.g., KeePassXC)
+
+Uninstall command:
+
+sudo safesetid uninstall_script ${UNINSTALL_TOKEN}
+
+============================================================
+
+EOF
+
 	_log info "Full installation complete. Please configure your policies with 'safesetid configure_uid'."
 }
 
