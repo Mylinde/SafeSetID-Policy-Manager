@@ -1,141 +1,608 @@
 #!/usr/bin/env bash
-# Simple Denial‑of‑Service flood tester for safesetid monitor.
-# WARNING: run only on test systems or with care. Do NOT modify /etc/passwd.
-# Usage:
-#   sudo ./dos_test_flood.sh [-d duration_seconds] [-p writers] [-i interval] [--group] [--stop]
+# filepath: /home/mario/Github/SafeSetID-Policy-Manager/Test/dos_test_flood
+# =========================================================================
+# SafeSetID DoS Flood Test Script
+# 
+# Purpose: Simulate denial-of-service attack by frequently modifying
+#          /etc/safesetid/* files to test DOS protection mechanisms.
 #
-set -euo pipefail
+# WARNING: This script performs intensive I/O operations.
+#          - Run ONLY on test systems
+#          - Do NOT modify /etc/passwd or /etc/group on production
+#          - Monitor system resources during test
+#
+# Usage:
+#   sudo ./dos_test_flood [-d duration] [-p writers] [-i interval] [--group] [--stop]
+#
+# Licensing: MIT
+# Copyright (c) 2025 Mario Herrmann. All rights reserved.
+# =========================================================================
 
+set -euo pipefail
+umask 027
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH LC_ALL=C LANG=C
+
+# =========================================================================
+# Configuration & Constants
+# =========================================================================
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly PIDFILE="/var/run/dos_test_flood.pids"
+readonly LOCKFILE="/var/run/dos_test_flood.lock"
+readonly LOGFILE="/var/log/dos_test_flood.log"
+
+# Default parameters
 DURATION=30
 PARALLEL=2
 INTERVAL=0.2
 USE_GROUP=0
-PIDFILE="/var/run/dos_test_flood.pids"
-FILES=(/etc/safesetid/*)
+ACTION="run"
 
-print_usage() {
-  cat <<USAGE
-dos_test_flood.sh - simple tester to simulate frequent file changes.
+# Safety limits (prevent accidental system overload)
+readonly MAX_DURATION=300      # 5 minutes max
+readonly MAX_PARALLEL=50       # 50 writers max
+readonly MIN_INTERVAL=0.05     # 50ms minimum interval
 
-Options:
-  -d <seconds>    Duration to run the flood (default: ${DURATION})
-  -p <writers>    Number of parallel writer processes (default: ${PARALLEL})
-  -i <interval>   Interval between writes per writer in seconds (float, default: ${INTERVAL})
-  --group         Also touch /etc/group (use with extreme care)
-  --stop          Stop running flood writers (reads PIDFILE=${PIDFILE})
-  -h | --help     Show this help
+# Files to modify (default: only safesetid configs)
+FILES=(/etc/safesetid/uid.config /etc/safesetid/gid.config)
+
+# =========================================================================
+# Logging & Utilities
+# =========================================================================
+
+_log() {
+    local level="$1"
+    shift
+    local msg="$*"
+    local timestamp
+    timestamp="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    
+    # Log to file
+    printf '[%s] [%s] %s\n' "${timestamp}" "${level}" "${msg}" >> "${LOGFILE}" 2>/dev/null || true
+    
+    # Also print to console
+    case "${level}" in
+        ERROR)
+            echo "❌ ERROR: ${msg}" >&2
+            ;;
+        WARN)
+            echo "⚠️  WARN: ${msg}" >&2
+            ;;
+        INFO)
+            echo "ℹ️  INFO: ${msg}"
+            ;;
+        *)
+            echo "${msg}"
+            ;;
+    esac
+}
+
+_print_usage() {
+    cat <<'USAGE'
+╔═══════════════════════════════════════════════════════════════════════╗
+║              SafeSetID DoS Flood Test Script                          ║
+║                                                                       ║
+║  Simulates frequent file changes to test DOS protection mechanisms.  ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+USAGE:
+    sudo ./dos_test_flood [OPTIONS]
+
+OPTIONS:
+    -d <seconds>     Duration to run flood test (default: 30, max: 300)
+    -p <count>       Number of parallel writer processes (default: 2, max: 50)
+    -i <seconds>     Interval between writes (float, default: 0.2, min: 0.05)
+    --group          Also modify /etc/group (⚠️  DANGEROUS - test systems only!)
+    --stop           Stop running flood writers
+    -h, --help       Show this help message
+
+EXAMPLES:
+    # Moderate load (recommended first test)
+    sudo ./dos_test_flood -d 30 -p 2 -i 0.5
+
+    # High load (stress test)
+    sudo ./dos_test_flood -d 60 -p 5 -i 0.2
+
+    # Stop running test
+    sudo ./dos_test_flood --stop
+
+SAFETY LIMITS:
+    - Maximum duration: 300 seconds (5 minutes)
+    - Maximum parallel writers: 50
+    - Minimum interval: 0.05 seconds (50ms)
+
+LOGS:
+    Script log:     ${LOGFILE}
+    SafeSetID logs: journalctl -t safesetid -t safesetid-wrapper -f
+
 USAGE
 }
 
-if [ "$#" -gt 0 ]; then
-  # simple args parser
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -d) DURATION="$2"; shift 2 ;;
-      -p) PARALLEL="$2"; shift 2 ;;
-      -i) INTERVAL="$2"; shift 2 ;;
-      --group) USE_GROUP=1; shift ;;
-      --stop) ACTION="stop"; shift ;;
-      -h|--help) print_usage; exit 0 ;;
-      *) echo "Unknown arg: $1"; print_usage; exit 2 ;;
-    esac
-  done
-fi
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "This script must be run as root (to write /etc/safesetid/*). Use sudo." >&2
-  exit 1
-fi
-
-if [ "${ACTION:-run}" = "stop" ]; then
-  if [ -f "${PIDFILE}" ]; then
-    echo "Stopping flood writers (pids in ${PIDFILE})..."
-    while read -r pid; do
-      [ -n "$pid" ] || continue
-      if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-      fi
-    done < "${PIDFILE}" || true
-    rm -f "${PIDFILE}" || true
-    echo "Stopped."
-    exit 0
-  else
-    echo "No PID file (${PIDFILE}) found."
-    exit 1
-  fi
-fi
-
-if [ "${USE_GROUP}" -eq 1 ]; then
-  FILES+=(/etc/group)
-  echo "WARNING: /etc/group will be modified during test. Ensure this is acceptable."
-fi
-
-# ensure files exist (create if missing) with safe permissions
-for f in "${FILES[@]}"; do
-  dir=$(dirname "$f")
-  mkdir -p "$dir" 2>/dev/null || true
-  touch "$f" 2>/dev/null || true
-  chown root:root "$f" 2>/dev/null || true
-  chmod 600 "$f" 2>/dev/null || true
-done
-
-# worker function
-_writer_main() {
-  local id="$1"
-  local interval="$2"
-  local files=("${!3}")
-  # loop writing timestamp + id + random to files
-  while true; do
-    local t ts rand s
-    ts="$(date -u +%Y%m%dT%H%M%SZ)"
-    rand="$(head -c 6 /dev/urandom | od -A n -t x1 2>/dev/null | tr -d ' \n')"
-    s="${ts} flood-w${id} r=${rand}"
-    for f in "${files[@]}"; do
-      # atomic write: write to tmp and move
-      tmp="$(mktemp "${f}.tmp.XXXXXX" 2>/dev/null || true)"
-      if [ -n "$tmp" ]; then
-        printf '%s\n' "$s" > "$tmp" 2>/dev/null || true
-        chmod 600 "$tmp" 2>/dev/null || true
-        mv -f "$tmp" "$f" 2>/dev/null || true
-      else
-        # fallback append to file (less atomic)
-        printf '%s\n' "$s" >> "$f" 2>/dev/null || true
-      fi
-    done
-    sleep "$interval"
-  done
+_print_banner() {
+    cat <<'BANNER'
+╔═══════════════════════════════════════════════════════════════════════╗
+║                   🔥 DOS FLOOD TEST STARTING 🔥                       ║
+╚═══════════════════════════════════════════════════════════════════════╝
+BANNER
 }
 
-# spawn writers
-echo "Starting ${PARALLEL} writer(s) for ${DURATION}s, interval=${INTERVAL}s, files=${FILES[*]}"
-rm -f "${PIDFILE}" || true
-pids=()
-for i in $(seq 1 "$PARALLEL"); do
-  # pass array by name: use indirect expansion
-  _writer_main "$i" "$INTERVAL" FILES[@] &
-  p=$!
-  echo "$p" >> "${PIDFILE}"
-  pids+=("$p")
-  echo "spawned writer pid $p"
-done
+# =========================================================================
+# Validation Functions
+# =========================================================================
 
-# wait for duration, then stop
-SECONDS=0
-while [ "$SECONDS" -lt "$DURATION" ]; do
-  sleep 1
-done
-
-echo "Duration expired: killing writers..."
-for p in "${pids[@]}"; do
-  if kill -0 "$p" 2>/dev/null; then
-    kill "$p" 2>/dev/null || true
-    sleep 0.5
-    if kill -0 "$p" 2>/dev/null; then
-      kill -KILL "$p" 2>/dev/null || true
+_validate_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        _log ERROR "This script must be run as root (to write /etc/safesetid/*)"
+        _log INFO "Please run: sudo ${SCRIPT_NAME}"
+        exit 1
     fi
-  fi
+}
+
+_validate_duration() {
+    if ! [[ "${DURATION}" =~ ^[0-9]+$ ]]; then
+        _log ERROR "DURATION must be a positive integer: ${DURATION}"
+        exit 2
+    fi
+    
+    if [ "${DURATION}" -gt "${MAX_DURATION}" ]; then
+        _log ERROR "DURATION too high: ${DURATION}s (max: ${MAX_DURATION}s)"
+        _log INFO "This limit prevents accidental system overload"
+        exit 2
+    fi
+    
+    if [ "${DURATION}" -lt 1 ]; then
+        _log ERROR "DURATION too low: ${DURATION}s (min: 1s)"
+        exit 2
+    fi
+}
+
+_validate_parallel() {
+    if ! [[ "${PARALLEL}" =~ ^[0-9]+$ ]]; then
+        _log ERROR "PARALLEL must be a positive integer: ${PARALLEL}"
+        exit 2
+    fi
+    
+    if [ "${PARALLEL}" -gt "${MAX_PARALLEL}" ]; then
+        _log ERROR "PARALLEL too high: ${PARALLEL} (max: ${MAX_PARALLEL})"
+        _log INFO "This limit prevents fork bomb scenarios"
+        exit 2
+    fi
+    
+    if [ "${PARALLEL}" -lt 1 ]; then
+        _log ERROR "PARALLEL too low: ${PARALLEL} (min: 1)"
+        exit 2
+    fi
+}
+
+_validate_interval() {
+    # Check if INTERVAL is a valid float using awk
+    if ! awk -v i="${INTERVAL}" 'BEGIN {exit !(i > 0)}' 2>/dev/null; then
+        _log ERROR "INTERVAL must be a positive number: ${INTERVAL}"
+        exit 2
+    fi
+    
+    # Check minimum interval
+    if awk -v i="${INTERVAL}" -v m="${MIN_INTERVAL}" 'BEGIN {exit !(i < m)}' 2>/dev/null; then
+        _log ERROR "INTERVAL too low: ${INTERVAL}s (min: ${MIN_INTERVAL}s)"
+        _log INFO "This limit prevents system overload (max ${PARALLEL} writers * $(awk "BEGIN {print 1/${MIN_INTERVAL}}") writes/s)"
+        exit 2
+    fi
+}
+
+_validate_files() {
+    local file
+    for file in "${FILES[@]}"; do
+        local dir
+        dir="$(dirname "${file}")"
+        
+        # Check if parent directory exists or can be created
+        if [ ! -d "${dir}" ]; then
+            if ! mkdir -p "${dir}" 2>/dev/null; then
+                _log ERROR "Cannot create directory: ${dir}"
+                exit 2
+            fi
+        fi
+        
+        # Check if file exists or can be created
+        if [ ! -f "${file}" ]; then
+            if ! touch "${file}" 2>/dev/null; then
+                _log ERROR "Cannot create file: ${file}"
+                exit 2
+            fi
+        fi
+        
+        # Check write permission
+        if [ ! -w "${file}" ]; then
+            _log ERROR "File not writable: ${file}"
+            exit 2
+        fi
+    done
+}
+
+# =========================================================================
+# Cleanup & Signal Handling
+# =========================================================================
+
+_cleanup() {
+    local exit_code="${1:-0}"
+    
+    _log INFO "Cleaning up..."
+    
+    # Kill all writer processes
+    if [ -f "${PIDFILE}" ]; then
+        while read -r pid; do
+            [ -n "${pid}" ] || continue
+            if kill -0 "${pid}" 2>/dev/null; then
+                _log INFO "Stopping writer PID ${pid}..."
+                kill "${pid}" 2>/dev/null || true
+                sleep 0.2
+                # Force kill if still alive
+                if kill -0 "${pid}" 2>/dev/null; then
+                    kill -KILL "${pid}" 2>/dev/null || true
+                fi
+            fi
+        done < "${PIDFILE}"
+        rm -f "${PIDFILE}"
+    fi
+    
+    # Also kill by process name (catch orphans)
+    pkill -f "_writer_main" 2>/dev/null || true
+    
+    # Remove lock
+    if [ -f "${LOCKFILE}" ]; then
+        rm -f "${LOCKFILE}"
+    fi
+    
+    _log INFO "Cleanup complete"
+    exit "${exit_code}"
+}
+
+# Trap signals for graceful cleanup
+trap '_cleanup 130' SIGINT SIGTERM
+trap '_cleanup 0' EXIT
+
+# =========================================================================
+# Writer Worker Function
+# =========================================================================
+
+_writer_main() {
+    local worker_id="$1"
+    local interval="$2"
+    shift 2
+    local files=("$@")
+    
+    _log INFO "Writer ${worker_id} started (PID=$$, interval=${interval}s)"
+    
+    local write_count=0
+    
+    while true; do
+        local timestamp rand content file tmp
+        
+        # Generate timestamp and random data
+        timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+        rand="$(head -c 6 /dev/urandom 2>/dev/null | od -A n -t x1 | tr -d ' \n' || echo "NORANDOM")"
+        content="${timestamp} writer-${worker_id} random=${rand} count=${write_count}"
+        
+        # Write to all files atomically
+        for file in "${files[@]}"; do
+            # Create temp file in /tmp (not in /etc/)
+            tmp="$(mktemp -p /tmp "dos_flood.XXXXXX" 2>/dev/null)" || {
+                _log WARN "Writer ${worker_id}: mktemp failed for ${file}"
+                continue
+            }
+            
+            # Secure temp file
+            chmod 600 "${tmp}" 2>/dev/null || true
+            
+            # Write content
+            if printf '%s\n' "${content}" > "${tmp}" 2>/dev/null; then
+                # Atomic move (even cross-device)
+                if mv -f "${tmp}" "${file}" 2>/dev/null; then
+                    : # Success
+                else
+                    # Fallback: copy and remove
+                    if cat "${tmp}" > "${file}" 2>/dev/null; then
+                        rm -f "${tmp}" 2>/dev/null || true
+                    else
+                        _log WARN "Writer ${worker_id}: failed to write ${file}"
+                        rm -f "${tmp}" 2>/dev/null || true
+                    fi
+                fi
+            else
+                _log WARN "Writer ${worker_id}: failed to write to temp file"
+                rm -f "${tmp}" 2>/dev/null || true
+            fi
+        done
+        
+        write_count=$((write_count + 1))
+        
+        # Sleep between writes
+        sleep "${interval}"
+    done
+}
+
+# =========================================================================
+# Stop Running Flood
+# =========================================================================
+
+_stop_flood() {
+    _log INFO "Stopping running flood test..."
+    
+    if [ ! -f "${PIDFILE}" ]; then
+        _log WARN "No PID file found at: ${PIDFILE}"
+        _log INFO "No flood test appears to be running"
+        exit 0
+    fi
+    
+    local stopped_count=0
+    
+    while read -r pid; do
+        [ -n "${pid}" ] || continue
+        
+        if ! [[ "${pid}" =~ ^[0-9]+$ ]]; then
+            _log WARN "Invalid PID in file: ${pid}"
+            continue
+        fi
+        
+        if kill -0 "${pid}" 2>/dev/null; then
+            _log INFO "Stopping writer PID ${pid}..."
+            if kill "${pid}" 2>/dev/null; then
+                stopped_count=$((stopped_count + 1))
+                # Wait for graceful shutdown
+                local timeout=5
+                while [ "${timeout}" -gt 0 ] && kill -0 "${pid}" 2>/dev/null; do
+                    sleep 0.5
+                    timeout=$((timeout - 1))
+                done
+                # Force kill if still alive
+                if kill -0 "${pid}" 2>/dev/null; then
+                    _log WARN "Force killing PID ${pid}"
+                    kill -KILL "${pid}" 2>/dev/null || true
+                fi
+            else
+                _log WARN "Failed to kill PID ${pid}"
+            fi
+        fi
+    done < "${PIDFILE}"
+    
+    rm -f "${PIDFILE}"
+    _log INFO "Stopped ${stopped_count} writer(s)"
+    exit 0
+}
+
+# =========================================================================
+# Main Flood Test Logic
+# =========================================================================
+
+_run_flood_test() {
+    _print_banner
+    
+    # Show configuration
+    _log INFO "Test Configuration:"
+    _log INFO "  Duration:         ${DURATION} seconds"
+    _log INFO "  Parallel Writers: ${PARALLEL}"
+    _log INFO "  Write Interval:   ${INTERVAL} seconds"
+    _log INFO "  Target Files:     ${#FILES[@]} file(s)"
+    
+    for file in "${FILES[@]}"; do
+        _log INFO "    - ${file}"
+    done
+    
+    # Calculate expected load
+    local writes_per_second
+    writes_per_second="$(awk -v p="${PARALLEL}" -v i="${INTERVAL}" 'BEGIN {printf "%.1f", p/i}')"
+    local total_writes
+    total_writes="$(awk -v d="${DURATION}" -v w="${writes_per_second}" 'BEGIN {printf "%.0f", d*w}')"
+    
+    _log INFO "Expected Load:"
+    _log INFO "  Writes/second:    ${writes_per_second}"
+    _log INFO "  Total writes:     ${total_writes}"
+    
+    # Check for existing flood test
+    if [ -f "${PIDFILE}" ]; then
+        _log ERROR "Another flood test is already running (PID file exists)"
+        _log INFO "Stop it first with: sudo ${SCRIPT_NAME} --stop"
+        exit 1
+    fi
+    
+    # Acquire lock to prevent concurrent tests
+    if command -v flock >/dev/null 2>&1; then
+        exec 200>"${LOCKFILE}"
+        if ! flock -n 200; then
+            _log ERROR "Another instance is already running (lock held)"
+            exit 1
+        fi
+    fi
+    
+    # Ensure target files exist with safe permissions
+    _log INFO "Preparing target files..."
+    for file in "${FILES[@]}"; do
+        local dir
+        dir="$(dirname "${file}")"
+        mkdir -p "${dir}" 2>/dev/null || true
+        touch "${file}" 2>/dev/null || true
+        chown root:root "${file}" 2>/dev/null || true
+        chmod 600 "${file}" 2>/dev/null || true
+    done
+    
+    # Spawn writer processes
+    _log INFO "Spawning ${PARALLEL} writer process(es)..."
+    rm -f "${PIDFILE}"
+    
+    local pids=()
+    local i
+    for i in $(seq 1 "${PARALLEL}"); do
+        # Start writer in background
+        _writer_main "${i}" "${INTERVAL}" "${FILES[@]}" &
+        local pid=$!
+        echo "${pid}" >> "${PIDFILE}"
+        pids+=("${pid}")
+        _log INFO "Spawned writer #${i} (PID=${pid})"
+    done
+    
+    _log INFO "All writers started. Test running for ${DURATION} seconds..."
+    _log INFO "Monitor logs: journalctl -t safesetid -t safesetid-wrapper -f"
+    
+    # Wait for duration
+    local elapsed=0
+    while [ "${elapsed}" -lt "${DURATION}" ]; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        
+        # Progress indicator every 10 seconds
+        if [ $((elapsed % 10)) -eq 0 ]; then
+            _log INFO "Progress: ${elapsed}/${DURATION} seconds ($(awk -v e="${elapsed}" -v d="${DURATION}" 'BEGIN {printf "%.0f", (e/d)*100}')%)"
+        fi
+    done
+    
+    _log INFO "Duration expired. Stopping writers..."
+    
+    # Stop all writers
+    for pid in "${pids[@]}"; do
+        if kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
+            sleep 0.5
+            # Force kill if needed
+            if kill -0 "${pid}" 2>/dev/null; then
+                kill -KILL "${pid}" 2>/dev/null || true
+            fi
+        fi
+    done
+    
+    rm -f "${PIDFILE}"
+    
+    cat <<'RESULTS'
+
+╔═══════════════════════════════════════════════════════════════════════╗
+║                        TEST COMPLETED                                 ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+RESULTS:
+    Check SafeSetID logs for DOS protection behavior:
+    
+    # Recent logs
+    journalctl -t safesetid -t safesetid-wrapper --since "5 minutes ago" --no-pager
+    
+    # Follow live logs
+    journalctl -t safesetid -t safesetid-wrapper -f
+    
+    # Check for DOS mitigation
+    journalctl -t safesetid --since "5 minutes ago" | grep -i "dos"
+
+EXPECTED BEHAVIOR:
+    ✓ DOS protection should trigger after threshold exceeded
+    ✓ Mitigation should prevent check_function during active period
+    ✓ System should remain responsive throughout test
+    ✓ No kernel panics or crashes
+
+RESULTS
+    
+    _log INFO "Test script log saved to: ${LOGFILE}"
+}
+
+# =========================================================================
+# Argument Parsing
+# =========================================================================
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -d|--duration)
+            if [ -z "${2:-}" ]; then
+                _log ERROR "Option -d requires an argument"
+                exit 2
+            fi
+            DURATION="$2"
+            shift 2
+            ;;
+        -p|--parallel)
+            if [ -z "${2:-}" ]; then
+                _log ERROR "Option -p requires an argument"
+                exit 2
+            fi
+            PARALLEL="$2"
+            shift 2
+            ;;
+        -i|--interval)
+            if [ -z "${2:-}" ]; then
+                _log ERROR "Option -i requires an argument"
+                exit 2
+            fi
+            INTERVAL="$2"
+            shift 2
+            ;;
+        --group)
+            USE_GROUP=1
+            shift
+            ;;
+        --stop)
+            ACTION="stop"
+            shift
+            ;;
+        -h|--help)
+            _print_usage
+            exit 0
+            ;;
+        *)
+            _log ERROR "Unknown argument: $1"
+            _print_usage
+            exit 2
+            ;;
+    esac
 done
 
-rm -f "${PIDFILE}" || true
-echo "Done. Check safesetid logs: journalctl -f -t safesetid -n 200 --no-pager"
+# =========================================================================
+# Main Execution
+# =========================================================================
+
+# Always validate root
+_validate_root
+
+# Handle --stop action
+if [ "${ACTION}" = "stop" ]; then
+    _stop_flood
+    exit 0
+fi
+
+# Add /etc/group if requested (with scary warning)
+if [ "${USE_GROUP}" -eq 1 ]; then
+    cat <<'WARNING'
+
+╔═══════════════════════════════════════════════════════════════════════╗
+║                        ⚠️  CRITICAL WARNING ⚠️                         ║
+║                                                                       ║
+║  You have requested to modify /etc/group during this test.           ║
+║                                                                       ║
+║  DANGER: Corrupting /etc/group can make your system UNBOOTABLE!      ║
+║                                                                       ║
+║  This should ONLY be done on:                                        ║
+║    • Disposable test VMs                                             ║
+║    • Systems with full backups                                       ║
+║    • Environments where system recovery is trivial                   ║
+║                                                                       ║
+║  DO NOT run this on production systems!                              ║
+║                                                                       ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+Type 'I ACCEPT THE RISK' to proceed (case-sensitive):
+WARNING
+    read -r response
+    if [ "${response}" != "I ACCEPT THE RISK" ]; then
+        _log INFO "Test cancelled (wise decision)"
+        exit 0
+    fi
+    
+    FILES+=(/etc/group)
+    _log WARN "Added /etc/group to target files (you have been warned!)"
+fi
+
+# Validate all parameters
+_validate_duration
+_validate_parallel
+_validate_interval
+_validate_files
+
+# Run the flood test
+_run_flood_test
+
 exit 0

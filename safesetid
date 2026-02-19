@@ -87,35 +87,37 @@ DOS_ACTIVITY_FILE="${BACKUP_DIR}/.monitor_activity" # timestamp log of monitor e
 # usage: _log <level> <message...>
 # levels: debug, info, notice, warning, err
 _log() {
-	local level="$1"
-	shift
-	local msg="$*"
+    local level="$1"
+    shift
+    local msg="$*"
 
-	# sanitize level
-	case "${level}" in
-	warning|err) ;;
-	*) level="info" ;;
-	esac
+    # sanitize level
+    case "${level}" in
+    warning|err) ;;
+    *) level="info" ;;
+    esac
 
-	# prefer explicit LOG_TTY only if it is a character device under /dev
-	local target_tty=""
-	if [ -n "${LOG_TTY:-}" ] && [ -c "${LOG_TTY}" ] && [[ "${LOG_TTY}" == /dev/tty* ]]; then
-		target_tty="${LOG_TTY}"
-	else
-		if tty -s; then
-			target_tty="$(tty 2>/dev/null || true)"
-		fi
+    # prefer explicit LOG_TTY only if it is a character device under /dev
+    local target_tty=""
+    if [ -n "${LOG_TTY:-}" ] && [ -c "${LOG_TTY}" ] && [[ "${LOG_TTY}" == /dev/tty* ]]; then
+        target_tty="${LOG_TTY}"
+    else
+        # FIX: Only attempt TTY reattachment if we're not in systemd context
+        if tty -s && [ -z "${SYSTEMD_EXEC_PID:-}" ] && [ -z "${INVOCATION_ID:-}" ]; then
+            target_tty="$(tty 2>/dev/null || true)"
+        fi
 
-		if [ -z "${target_tty}" ] && [ -e /dev/tty ]; then
-			target_tty="/dev/tty"
-		fi
-	fi
+        # FIX: Check if /dev/tty exists AND we're not in systemd before using it
+        if [ -z "${target_tty}" ] && [ -e /dev/tty ] && [ -z "${SYSTEMD_EXEC_PID:-}" ] && [ -z "${INVOCATION_ID:-}" ]; then
+            target_tty="/dev/tty"
+        fi
+    fi
 
-	if [ -n "${target_tty}" ] && [ -w "${target_tty}" ]; then
-		printf '%s\n' "${msg}" >"${target_tty}" 2>/dev/null || true
-	fi
-	# Always send to syslog (avoid silent loss if TTY write fails)
-	logger -t safesetid -p "user.${level}" -- "${msg}" 2>/dev/null || true
+    if [ -n "${target_tty}" ] && [ -w "${target_tty}" ]; then
+        printf '%s\n' "${msg}" >"${target_tty}" 2>/dev/null || true
+    fi
+    # Always send to syslog (avoid silent loss if TTY write fails)
+    logger -t safesetid -p "user.${level}" -- "${msg}" 2>/dev/null || true
 }
 
 # must run as root
@@ -183,12 +185,22 @@ _update_datastore_hash() {
     # Store hash before move for verification
     old_hash="$(sha256sum "${tmp}" 2>/dev/null | awk '{print $1}' || true)"
     
+    # FIX: Temporarily remove immutable flag if set
+    if command -v chattr >/dev/null 2>&1 && [ -f "${DATASTORE_HASH_FILE}" ]; then
+        chattr -i "${DATASTORE_HASH_FILE}" 2>/dev/null || true
+    fi
+    
     mv "${tmp}" "${DATASTORE_HASH_FILE}" 2>/dev/null || {
         _log err "ERROR: cannot write datastore hash to ${DATASTORE_HASH_FILE}"
         rm -f "${tmp}" 2>/dev/null || true
         return 1
     }
     chmod 644 "${DATASTORE_HASH_FILE}" 2>/dev/null || true
+    
+    # FIX: Re-apply immutable flag
+    if command -v chattr >/dev/null 2>&1; then
+        chattr +i "${DATASTORE_HASH_FILE}" 2>/dev/null || true
+    fi
     
     # Verify hash after write (integrity check)
     new_hash="$(sha256sum "${DATASTORE_HASH_FILE}" 2>/dev/null | awk '{print $1}' || true)"
@@ -222,30 +234,100 @@ _sync_temp_from_datastore() {
 	return 0
 }
 
-# Restore datastore files from private temp store
+# Atomically restore the datastore from the tmpfs-backed temp store.
+# This is the LAST LINE OF DEFENSE: if the on-disk datastore is corrupt,
+# restore from the known-good copy in tmpfs (which is only writable by root
+# and resides in RAM).
 _restore_datastore_from_temp() {
-	if [ ! -d "${TEMP_STORE_DIR}" ]; then
-		_log err "Temp store ${TEMP_STORE_DIR} missing; cannot restore datastore"
-		return 1
-	fi
+    if [ ! -d "${TEMP_STORE_DIR}" ]; then
+        _log err "Temp store ${TEMP_STORE_DIR} missing; cannot restore datastore"
+        return 1
+    fi
 
-	for f in "${DATASTORE_FILES[@]}"; do
-		src="${TEMP_STORE_DIR}/$(basename "${f}")"
-		if [ -f "${src}" ]; then
-			# write atomically to target
-			if ! _atomic_write "${f}" "$(cat "${src}" 2>/dev/null || true)"; then
-				_log warning "WARN: failed to restore ${f} from temp store"
-			else
-				chmod 600 "${f}" 2>/dev/null || true
-				chown root:root "${f}" 2>/dev/null || true
-				_log info "Restored ${f} from temp store"
-			fi
-		fi
-	done
+    _log warning "Attempting restore from ${TEMP_STORE_DIR}"
 
-	# After restore, update datastore hash to reflect restored state
-	_update_datastore_hash || true
-	return 0
+    # FIX: Remove immutable flags from ALL datastore files before restore
+    if command -v chattr >/dev/null 2>&1; then
+        for f in "${DATASTORE_FILES[@]}"; do
+            if [ -f "${f}" ]; then
+                chattr -i "${f}" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # Restore each file from temp store
+    for f in "${DATASTORE_FILES[@]}"; do
+        local src base
+        base="$(basename "${f}")" || {
+            _log warning "WARN: basename failed for ${f}"
+            continue
+        }
+        src="${TEMP_STORE_DIR}/${base}"
+        
+        if [ -f "${src}" ]; then
+            # Atomic restore via temp file
+            local tmp
+            tmp="$(mktemp "${f}.restore.XXXXXX" 2>/dev/null)" || {
+                _log warning "WARN: cannot create temp file for restore of ${f}"
+                continue
+            }
+            
+            # Copy from tmpfs to temp file
+            if cat "${src}" >"${tmp}" 2>/dev/null; then
+                # Atomic move
+                if mv -f "${tmp}" "${f}" 2>/dev/null; then
+                    chmod 600 "${f}" 2>/dev/null || true
+                    chown root:root "${f}" 2>/dev/null || true
+                    _log info "Restored ${f} from temp store"
+                else
+                    _log warning "WARN: failed to move restored file to ${f}"
+                    rm -f "${tmp}" 2>/dev/null || true
+                fi
+            else
+                _log warning "WARN: failed to restore ${f} from temp store"
+                rm -f "${tmp}" 2>/dev/null || true
+            fi
+        fi
+    done
+
+    # FIX: Re-apply immutable flags after restore
+    if command -v chattr >/dev/null 2>&1; then
+        local protected_files=(
+            "${CANON_UID}"
+            "${CANON_GID}"
+            "${CANON_UID_CONFIG}"
+            "${CANON_GID_CONFIG}"
+            "${UID_BACKUP}"
+            "${GID_BACKUP}"
+            "${DATASTORE_HASH_FILE}"
+            "${CANON_SCRIPT_HASH_FILE}"
+            "${TRUSTED_SCRIPT_BACKUP}"
+            "${WRAPPER_TRUSTED_BACKUP}"
+        )
+        
+        for f in "${protected_files[@]}"; do
+            if [ -f "${f}" ]; then
+                chattr +i "${f}" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # After restore, verify hash integrity
+    if ! _update_datastore_hash; then
+        _log err "ERROR: datastore hash verification failed after restore"
+        return 1
+    fi
+
+    # Compute new hash of restored datastore
+    local restored_hash
+    restored_hash="$(_compute_datastore_hash)"
+    if [ -z "${restored_hash}" ]; then
+        _log err "Restore did not fully reconcile datastore"
+        return 1
+    fi
+
+    _log info "Restore complete; new datastore hash=${restored_hash}"
+    return 0
 }
 
 # Verify datastore against stored hash and restore from temp if mismatch
@@ -375,36 +457,56 @@ _file_sha() {
 
 # Write canonical copy and meta (sha + timestamp)
 _write_canonical_allowlist() {
-	local canon="$1"
-	local content="$2"
-	local meta="$3"
+    local canon="$1"
+    local content="$2"
+    local meta="$3"
 
-	mkdir -p "${BACKUP_DIR}"
-	chmod 700 "${BACKUP_DIR}" 2>/dev/null || true
-	echo -n "${content}" >"${canon}" || {
-		_log warning "WARN: failed to write canonical ${canon}"
-		return 1
-	}
-	# ensure trailing newline and perms
-	case "$(tail -c1 "${canon}" 2>/dev/null || printf '')" in
-	$'\n') ;;
-	*) printf '\n' >>"${canon}" ;;
-	esac
-	chmod 600 "${canon}" 2>/dev/null || true
-	chown root:root "${canon}" 2>/dev/null || true
-	# write meta: sha timestamp (UTC epoch)
-	local sha ts
-	sha="$(_file_sha "${canon}")"
-	ts="$(date -u +%s)"
-	printf '%s %s\n' "${sha}" "${ts}" >"${meta}" 2>/dev/null || true
-	chmod 600 "${meta}" 2>/dev/null || true
-	chown root:root "${meta}" 2>/dev/null || true
+    mkdir -p "${BACKUP_DIR}"
+    chmod 700 "${BACKUP_DIR}" 2>/dev/null || true
+    
+    # FIX: Temporarily remove immutable if set (to allow write)
+    if command -v chattr >/dev/null 2>&1; then
+        chattr -i "${canon}" 2>/dev/null || true
+        chattr -i "${meta}" 2>/dev/null || true
+    fi
+    
+    echo -n "${content}" >"${canon}" || {
+        _log warning "WARN: failed to write canonical ${canon}"
+        # FIX: Re-apply immutable even on failure
+        if command -v chattr >/dev/null 2>&1; then
+            chattr +i "${canon}" 2>/dev/null || true
+            chattr +i "${meta}" 2>/dev/null || true
+        fi
+        return 1
+    }
+    
+    # Ensure trailing newline
+    if [ -n "${content}" ] && [[ "${content}" != *$'\n' ]]; then
+        echo >>"${canon}"
+    fi
+    
+    chmod 600 "${canon}" 2>/dev/null || true
+    chown root:root "${canon}" 2>/dev/null || true
+    
+    # write meta: sha timestamp (UTC epoch)
+    local sha ts
+    sha="$(_file_sha "${canon}")"
+    ts="$(date -u +%s)"
+    printf '%s %s\n' "${sha}" "${ts}" >"${meta}" 2>/dev/null || true
+    chmod 600 "${meta}" 2>/dev/null || true
+    chown root:root "${meta}" 2>/dev/null || true
+    
+    # FIX: Re-apply immutable protection
+    if command -v chattr >/dev/null 2>&1; then
+        chattr +i "${canon}" 2>/dev/null || true
+        chattr +i "${meta}" 2>/dev/null || true
+    fi
 
-	# Update datastore hash and sync temp store after legitimate change
-	_update_datastore_hash || true
-	_sync_temp_from_datastore || true
+    # Update datastore hash and sync temp store after legitimate change
+    _update_datastore_hash || true
+    _sync_temp_from_datastore || true
 
-	return 0
+    return 0
 }
 
 init() {
@@ -453,7 +555,7 @@ GIDC
 		_write_canonical_allowlist "${CANON_GID_CONFIG}" "$(cat "${GID_CONFIG}" 2>/dev/null || true)" "${META_GID_CONFIG}" || true
 	fi
 
-	getent passwd >"${UID_BACKUP}"
+	getent passwd >"${UID_BACKUP}" 2>/dev/null || true
 	chmod 600 "${UID_BACKUP}" 2>/dev/null || true
 	chown root:root "${UID_BACKUP}" 2>/dev/null || true
 
@@ -559,7 +661,7 @@ _prune_old_backups() {
 	fi
 }
 
-# Ersetze die _preflight_and_backup Funktion (Zeilen 448-482):
+# Preflight and Backup
 _preflight_and_backup() {
     local target="$1"
     local skip_bak="${2:-0}"
@@ -1040,162 +1142,175 @@ _cleanup() {
 
 # record a monitor invocation timestamp
 _monitor_activity_record() {
-	mkdir -p "${BACKUP_DIR}" 2>/dev/null || true
-	touch "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
-	chmod 600 "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
-	chown root:root "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
+    mkdir -p "${BACKUP_DIR}" 2>/dev/null || true
+    touch "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
+    chmod 600 "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
+    chown root:root "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
 
-	local ACT_FD
-	# Open file for append on a private FD
-	exec {ACT_FD}>>"${DOS_ACTIVITY_FILE}" || return 0
+    local ACT_FD
+    # Open file for append on a private FD
+    exec {ACT_FD}>>"${DOS_ACTIVITY_FILE}" || return 0
 
-    # Acquire an exclusive lock (non-blocking). If flock missing, fall back to write without lock.
+    # FIX: Use blocking flock with timeout instead of skipping
     if command -v flock >/dev/null 2>&1; then
-        # don't block: if another writer holds the lock, skip appending this event
-        if ! flock -n "${ACT_FD}"; then
-            eval "exec ${ACT_FD}>&-"
-            return 0
+        if ! flock -w 2 "${ACT_FD}"; then
+            # If we can't acquire lock within 2s, write timestamp anyway (best-effort)
+            _log warning "WARN: DOS activity lock timeout; recording event anyway"
         fi
     fi
 
-	# Append timestamp
-	{ printf '%s\n' "$(date +%s)" >&"${ACT_FD}"; } 2>/dev/null || true
+    # Append timestamp
+    { printf '%s\n' "$(date +%s)" >&"${ACT_FD}"; } 2>/dev/null || true
 
-	# Release FD
-	eval "exec ${ACT_FD}>&-"
-	return 0
+    # Release FD
+    eval "exec ${ACT_FD}>&-"
+    return 0
 }
 
 # Check recent monitor activity and trigger mitigation if threshold exceeded
 _dos_check_and_mitigate() {
-	local tmp now mit_file count FD
+    local tmp now mit_file count FD
 
-	mit_file="${BACKUP_DIR}/.dos_mitigate"
-	now="$(date +%s)"
+    mit_file="${BACKUP_DIR}/.dos_mitigate"
+    now="$(date +%s)"
 
-	# ensure activity file exists and is pruned to the sliding window
-	mkdir -p "${BACKUP_DIR}" 2>/dev/null || true
-	touch "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
-	chmod 600 "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
+    # FIX: Check if mitigation is ALREADY active (skip ALL operations)
+    if [ -f "${mit_file}" ]; then
+        local mit_until
+        mit_until="$(awk '{print $1}' "${mit_file}" 2>/dev/null || echo 0)"
+        
+        if [ -n "${mit_until}" ] && [ "${now}" -lt "${mit_until}" ]; then
+            # Mitigation already active - SKIP everything (no file ops, no verification)
+            _log info "DOS: mitigation active (until ${mit_until}); skipping all operations"
+            return 0
+        else
+            # Mitigation expired - remove marker and CONTINUE with normal flow
+            rm -f "${mit_file}" 2>/dev/null || true
+            _log info "DOS: mitigation expired; resuming normal operations"
+        fi
+    fi
 
-	# Open DOS_ACTIVITY_FILE and lock it while we prune/read+rewrite it
-	exec {FD}<> "${DOS_ACTIVITY_FILE}" || return 1
-	if command -v flock >/dev/null 2>&1; then
-		if ! flock -x "${FD}"; then
-			eval "exec ${FD}>&-"
-			return 1
-		fi
-	fi
+    # ensure activity file exists and is pruned to the sliding window
+    mkdir -p "${BACKUP_DIR}" 2>/dev/null || true
+    touch "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
+    chmod 600 "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
 
-	# Prune timestamps outside the window and count
-	tmp="$(mktemp "${BACKUP_DIR}/.monitor_activity.XXXXXX")" || { eval "exec ${FD}>&-"; return 1; }
-	awk -v now="${now}" -v w="${DOS_WINDOW_SECONDS}" '$1+0 >= (now - w) { print $1 }' "${DOS_ACTIVITY_FILE}" >"${tmp}" 2>/dev/null || true
-	count="$(wc -l <"${tmp}" 2>/dev/null || echo 0)"
-	# Replace activity file atomically (while we still hold the lock)
-	mv -f "${tmp}" "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
-	chmod 600 "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
+    # Open DOS_ACTIVITY_FILE and lock it while we prune/read+rewrite it
+    exec {FD}<> "${DOS_ACTIVITY_FILE}" || return 1
+    if command -v flock >/dev/null 2>&1; then
+        if ! flock -x "${FD}"; then
+            eval "exec ${FD}>&-"
+            return 1
+        fi
+    fi
 
-	# release lock and FD
-	eval "exec ${FD}>&-"
-	
-	if [ "${count}" -ge "${DOS_THRESHOLD}" ]; then
-			_log warning "DOS: threshold exceeded (${count} >= ${DOS_THRESHOLD}); running mitigation"
-			# Set mitigation marker with expiry and do not recurse
-			echo "$(( now + DOS_PROTECT_DURATION ))" > "${mit_file}"
-			chmod 600 "${mit_file}" 2>/dev/null || true
-			_dos_mitigate
-			return 0
-		else
-			# Ensure restore helper and wrapper exist before performing datastore checks
-			_ensure_helpers_present || _log warning "WARN: _ensure_helpers_present reported issues"
+    # Prune timestamps outside the window and count
+    tmp="$(mktemp "${BACKUP_DIR}/.monitor_activity.XXXXXX")" || { eval "exec ${FD}>&-"; return 1; }
+    awk -v now="${now}" -v w="${DOS_WINDOW_SECONDS}" '$1+0 >= (now - w) { print $1 }' "${DOS_ACTIVITY_FILE}" >"${tmp}" 2>/dev/null || true
+    count="$(wc -l <"${tmp}" 2>/dev/null || echo 0)"
+    # Replace activity file atomically (while we still hold the lock)
+    mv -f "${tmp}" "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
+    chmod 600 "${DOS_ACTIVITY_FILE}" 2>/dev/null || true
 
-			# Ensure datastore integrity first (will restore from tmpfs if needed)
-			_check_and_restore_datastore_if_needed || _log warning "WARN: datastore integrity check/restore reported issues"
-			
-			_verify_configdir
-			_verify_and_restore "${UID_CONFIG}" "${CANON_UID_CONFIG}" "${META_UID_CONFIG}" "UID config"
-			_verify_and_restore "${GID_CONFIG}" "${CANON_GID_CONFIG}" "${META_GID_CONFIG}" "GID config"
-			
-			_verify_and_restore "${ALLOWLIST_UID}" "${CANON_UID}" "${META_UID}" "UID allowlist"
-			_verify_and_restore "${ALLOWLIST_GID}" "${CANON_GID}" "${META_GID}" "GID allowlist"
+    # release lock and FD
+    eval "exec ${FD}>&-"
+    
+    if [ "${count}" -ge "${DOS_THRESHOLD}" ]; then
+        _log warning "DOS: threshold exceeded (${count} >= ${DOS_THRESHOLD}); running mitigation"
+        # Set mitigation marker with expiry
+        echo "$(( now + DOS_PROTECT_DURATION ))" > "${mit_file}"
+        chmod 600 "${mit_file}" 2>/dev/null || true
+        _dos_mitigate  # ← Runs mitigation (fuser loop ONLY)
+        return 0
+    else
+        # Normal operation: perform verification
+        _ensure_helpers_present || _log warning "WARN: _ensure_helpers_present reported issues"
+        _check_and_restore_datastore_if_needed || _log warning "WARN: datastore integrity check/restore reported issues"
+        
+        _verify_configdir
+        _verify_and_restore "${UID_CONFIG}" "${CANON_UID_CONFIG}" "${META_UID_CONFIG}" "UID config"
+        _verify_and_restore "${GID_CONFIG}" "${CANON_GID_CONFIG}" "${META_GID_CONFIG}" "GID config"
+        
+        _verify_and_restore "${ALLOWLIST_UID}" "${CANON_UID}" "${META_UID}" "UID allowlist"
+        _verify_and_restore "${ALLOWLIST_GID}" "${CANON_GID}" "${META_GID}" "GID allowlist"
 
-			_verify_systemd_units
-	fi
+        _verify_systemd_units
+    fi
 }
 
 _dos_mitigate() {
-	# files we consider critical and may temporarily protect (duplicates removed)
-	monitored_files=(
-		"/sys/kernel/security/safesetid/uid_allowlist_policy"
-		"/sys/kernel/security/safesetid/gid_allowlist_policy"
-		"/etc/safesetid/uid.config"
-		"/etc/safesetid/gid.config"
-		"/usr/local/bin/safesetid"
-		"/usr/local/bin/safesetid-wrapper"
-		"/usr/libexec/safesetid-restore-wrapper"
-		"/etc/systemd/system/var-tmp-safesetid.mount"
-		"/etc/systemd/system/safesetid.service"
-		"/etc/systemd/system/safesetid-wrapper-restore.path"
-		"/etc/systemd/system/safesetid-wrapper-restore.service"
-		"/etc/systemd/system/safesetid-monitor.path"
-		"/etc/systemd/system/safesetid-monitor.service"
-		"/etc/systemd/system/safesetid-file-monitor.path"
-		"/etc/systemd/system/safesetid-file-monitor.service"
-	)
+    # files we consider critical and may temporarily protect (duplicates removed)
+    monitored_files=(
+        "/sys/kernel/security/safesetid/uid_allowlist_policy"
+        "/sys/kernel/security/safesetid/gid_allowlist_policy"
+        "/etc/safesetid/uid.config"
+        "/etc/safesetid/gid.config"
+        "/usr/local/bin/safesetid"
+        "/usr/local/bin/safesetid-wrapper"
+        "/usr/libexec/safesetid-restore-wrapper"
+        "/etc/systemd/system/var-tmp-safesetid.mount"
+        "/etc/systemd/system/safesetid.service"
+        "/etc/systemd/system/safesetid-wrapper-restore.path"
+        "/etc/systemd/system/safesetid-wrapper-restore.service"
+        "/etc/systemd/system/safesetid-monitor.path"
+        "/etc/systemd/system/safesetid-monitor.service"
+        "/etc/systemd/system/safesetid-file-monitor.path"
+        "/etc/systemd/system/safesetid-file-monitor.service"
+    )
 
-	mit_file="${BACKUP_DIR}/.dos_mitigate"
-	now="$(date +%s)"
+    mit_file="${BACKUP_DIR}/.dos_mitigate"
+    now="$(date +%s)"
 
-	# only act if there is an active marker
-	if [ -f "${mit_file}" ]; then
-		local mit_until
-		mit_until="$(awk '{print $1}' "${mit_file}" 2>/dev/null || echo 0)"
+    # only act if there is an active marker
+    if [ -f "${mit_file}" ]; then
+        local mit_until
+        mit_until="$(awk '{print $1}' "${mit_file}" 2>/dev/null || echo 0)"
 
-		# if marker valid and not yet expired: keep running fuser periodically until expiry
-		if [ -n "${mit_until}" ] && [ "${now}" -lt "${mit_until}" ]; then
-			_log warning "DOS: mitigation active until ${mit_until} (now=${now}) — continuous fuser loop"
+        # if marker valid and not yet expired: keep running fuser periodically until expiry
+        if [ -n "${mit_until}" ] && [ "${now}" -lt "${mit_until}" ]; then
+            _log warning "DOS: mitigation active until ${mit_until} (now=${now}) — continuous fuser loop"
 
-			# interval between fuser runs (seconds); tuneable if needed
-			local interval=2
-			local remaining
+            # interval between fuser runs (seconds); tuneable if needed
+            local interval=2
+            local remaining
 
-			# loop until the marker expires
-			while :; do
-				now="$(date +%s)"
-				if [ "${now}" -ge "${mit_until}" ]; then
-					break
-				fi
+            # loop until the marker expires
+            while :; do
+                now="$(date +%s)"
+                if [ "${now}" -ge "${mit_until}" ]; then
+                    break
+                fi
 
-				# Run fuser in a best-effort manner each iteration
-				if command -v fuser >/dev/null 2>&1; then
-					# polite TERM to processes using monitored files; suppress errors
-					if [ "${#monitored_files[@]}" -gt 0 ]; then
-                        # Use -- to prevent option injection
+                # Run fuser in a best-effort manner each iteration
+                if command -v fuser >/dev/null 2>&1; then
+                    # polite TERM to processes using monitored files; suppress errors
+                    if [ "${#monitored_files[@]}" -gt 0 ]; then
                         fuser -wk -TERM -- "${monitored_files[@]}" 2>/dev/null || true
                     fi
-				fi
+                fi
 
-				# compute remaining time and sleep for the smaller of interval or remaining
-				remaining=$(( mit_until - $(date +%s) ))
-				if [ "${remaining}" -le 0 ]; then
-					break
-				elif [ "${remaining}" -lt "${interval}" ]; then
-					sleep "${remaining}" 2>/dev/null || true
-				else
-					sleep "${interval}" 2>/dev/null || true
-				fi
-			done
+                # compute remaining time and sleep for the smaller of interval or remaining
+                remaining=$(( mit_until - $(date +%s) ))
+                if [ "${remaining}" -le 0 ]; then
+                    break
+                elif [ "${remaining}" -lt "${interval}" ]; then
+                    sleep "${remaining}" 2>/dev/null || true
+                else
+                    sleep "${interval}" 2>/dev/null || true
+                fi
+            done
 
-			# After mitigation window expired: re-check/cleanup
-			_dos_check_and_mitigate
-		else
-			# expired or invalid marker -> remove and re-check
-			rm -f "${mit_file}" 2>/dev/null || true
-			_dos_check_and_mitigate
-		fi
-	else
-		return 0
-	fi
+            # FIX: After mitigation expires, just remove marker
+            # DO NOT call _dos_check_and_mitigate (verification will happen on next regular invocation)
+            rm -f "${mit_file}" 2>/dev/null || true
+            _log info "DOS: mitigation period ended; marker removed"
+        else
+            # expired or invalid marker -> remove
+            rm -f "${mit_file}" 2>/dev/null || true
+        fi
+    fi
+    
+    return 0
 }
 # --- DOS protection helpers ---
 
@@ -1369,6 +1484,10 @@ check_function() {
 	# add new entries (if any) and prune in same operation.
 	if [ -n "${new_uids}" ]; then
 		if _update_allowlist "${ALLOWLIST_UID}" "${ALLOWLIST_UID}" "${new_uids}" "" 1; then
+			# Add GID restrictions for new UIDs (prevent setgid escalation)
+        	_log info "Adding restrictive GID policies for new UIDs"
+        	_update_allowlist "${ALLOWLIST_GID}" "${ALLOWLIST_GID}" "${new_uids}" "" 0 || \
+            _log warning "WARN: failed to add GID restrictions for new UIDs"
 			# release global lock before returning
 			eval "exec ${LOCK_FD}>&-"
 			trap - EXIT INT TERM
@@ -1604,9 +1723,9 @@ GIDC
 
 # Function to create the self-healing wrapper script
 _create_wrapper() {
-	_log info "Creating self-healing wrapper at ${WRAPPER_SCRIPT_PATH}"
+    _log info "Creating self-healing wrapper at ${WRAPPER_SCRIPT_PATH}"
 
-	cat > "${WRAPPER_SCRIPT_PATH}" <<'WRAPPER_EOF'
+    cat > "${WRAPPER_SCRIPT_PATH}" <<'WRAPPER_EOF'
 #!/bin/bash
 set -eu
 
@@ -1617,11 +1736,11 @@ set -eu
 # Do not edit this file manually; it's generated by safesetid install_script.
 
 MAIN_SCRIPT="/usr/local/bin/safesetid"
+DATA_HASH_FILE="/var/lib/safesetid/datastore.sha256"
 SCRIPT_HASH_FILE="/var/lib/safesetid/safesetid.sha256"
 TRUSTED_BACKUP="/var/lib/safesetid/safesetid.bak"
-DATA_HASH_FILE="/var/lib/safesetid/datastore.sha256"
 TEMP_STORE_DIR="/var/tmp/safesetid"
-CONFIG_DIR="/etc/safesetid"
+LOCK_FILE="/var/lib/safesetid/.wrapper_lock"
 
 DATA_FILES=(
   "/var/lib/safesetid/uid_allowlist_policy.canonical"
@@ -1629,164 +1748,199 @@ DATA_FILES=(
   "/var/lib/safesetid/uid.config.canonical"
   "/var/lib/safesetid/gid.config.canonical"
   "/var/lib/safesetid/.uid"
-  "/var/lib/safesetid/.gid" 
+  "/var/lib/safesetid/.gid"
+  "/var/lib/safesetid/safesetid.sha256"
   "/var/lib/safesetid/safesetid.bak"
   "/var/lib/safesetid/safesetid-wrapper.bak"
-  "/var/lib/safesetid/safesetid.sha256"
 )
 
+# Helper to compute current datastore hash
 _compute_tmp() {
-  local out="$1"
-  : >"${out}"
-  for f in "${DATA_FILES[@]}"; do
-    if [ -f "${f}" ]; then
-      sha256sum "${f}" >> "${out}" 2>/dev/null || true
-    fi
-  done
-  sort -u "${out}" -o "${out}" 2>/dev/null || true
+    local out="$1"
+    : >"${out}"
+    for f in "${DATA_FILES[@]}"; do
+        if [ -f "${f}" ]; then
+            sha256sum "${f}" >> "${out}" 2>/dev/null || true
+        fi
+    done
+    sort -u "${out}" -o "${out}" 2>/dev/null || true
 }
 
+# Helper to ensure tmpfs mount
 _ensure_tempdir() {
-  # Try to make the TEMP_STORE_DIR available (best-effort).
-  if [ -d "${TEMP_STORE_DIR}" ]; then
-    return 0
-  fi
-  mkdir -p "${TEMP_STORE_DIR}" 2>/dev/null || return 1
-  chmod 700 "${TEMP_STORE_DIR}" 2>/dev/null || true
-
-  # if already a mountpoint, ok
-  if mountpoint -q "${TEMP_STORE_DIR}"; then
-    return 0
-  fi
-
-  # try to mount tmpfs as fallback (best-effort)
-  if mount -t tmpfs -o mode=700,uid=0,gid=0,nodev,noexec,nosuid tmpfs "${TEMP_STORE_DIR}" 2>/dev/null; then
-    logger -t safesetid-wrapper -p auth.notice "Mounted tmpfs at ${TEMP_STORE_DIR}"
-    return 0
-  fi
-
-  return 1
+    local tmp_dir="/var/tmp/safesetid"
+    
+    [ -d "${tmp_dir}" ] || mkdir -p "${tmp_dir}" 2>/dev/null || return 1
+    chmod 700 "${tmp_dir}" 2>/dev/null || true
+    
+    # Check if mounted (POSIX-compliant, no mountpoint needed)
+    if mount | grep -q "^tmpfs on ${tmp_dir} type tmpfs"; then
+        return 0
+    fi
+    
+    # Try mount
+    if mount -t tmpfs -o mode=700,uid=0,gid=0,nodev,noexec,nosuid tmpfs "${tmp_dir}" 2>/dev/null; then
+        return 0
+    else
+        logger -t safesetid-wrapper -p auth.warn "tmpfs mount failed at ${tmp_dir}"
+        return 1
+    fi
 }
 
-# Verify datastore integrity; attempt restore from TEMP_STORE_DIR if mismatch
+# Ensure the main script is available
+if [ ! -f "${MAIN_SCRIPT}" ]; then
+  echo "CRITICAL: Main script ${MAIN_SCRIPT} not found. Cannot start wrapper." >&2
+  logger -t safesetid-wrapper -p auth.crit "Main script not found"
+  exit 1
+fi
+
+# Ensure datastore directory exists
+if [ ! -d "/var/lib/safesetid" ]; then
+  mkdir -p "/var/lib/safesetid"
+  chmod 700 "/var/lib/safesetid"
+  chown root:root "/var/lib/safesetid"
+fi
+
+# Ensure tmpfs mount and populate if needed
+_ensure_tempdir || logger -t safesetid-wrapper -p auth.warn "Tmpfs mount unavailable"
+
+# FIX: Acquire lock BEFORE datastore check
+exec 200>"${LOCK_FILE}" || {
+  logger -t safesetid-wrapper -p auth.err "Failed to open lock file"
+  exit 1
+}
+
+if command -v flock >/dev/null 2>&1; then
+  if ! flock -n 200; then
+    logger -t safesetid-wrapper -p auth.notice "Another wrapper running; skipping"
+    exec 200>&-
+    exec /bin/bash "${MAIN_SCRIPT}" "$@"
+  fi
+fi
+
+# NOW datastore check and restore (protected by lock)
 if [ ! -f "${DATA_HASH_FILE}" ]; then
-  echo "CRITICAL: Data hash file not found. Cannot verify data integrity." >&2
-  logger -t safesetid-wrapper -p auth.crit "Data hash file ${DATA_HASH_FILE} not found. Halting."
+  logger -t safesetid-wrapper -p auth.crit "Data hash file not found"
+  exec 200>&-
   exit 1
 fi
 
 CURRENT_TMP="$(mktemp)" || {
-  logger -t safesetid-wrapper -p auth.crit "Failed to create temp file"
+  logger -t safesetid-wrapper -p auth.crit "Failed to create temp"
+  exec 200>&-
   exit 1
 }
 _compute_tmp "${CURRENT_TMP}"
 
 if ! cmp -s "${DATA_HASH_FILE}" "${CURRENT_TMP}"; then
-  # Persist computed list for debugging instead of immediately deleting it
+  # Datastore integrity mismatch detected
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   SAVED="/var/lib/safesetid/.datastore_check.${ts}"
+  
   if mv "${CURRENT_TMP}" "${SAVED}" 2>/dev/null; then
-    logger -t safesetid-wrapper -p auth.warn "Datastore integrity mismatch detected; saved computed list to ${SAVED}"
-
-    # Show a short summary of differences (up to 50 lines) between stored and computed
+    logger -t safesetid-wrapper -p auth.warn "Datastore integrity mismatch; saved to ${SAVED}"
+    
+    # Show differences (first 50 lines)
     if [ -f "${DATA_HASH_FILE}" ]; then
-      # comm requires sorted inputs; limit lines to avoid log flooding
       comm -3 <(sort "${DATA_HASH_FILE}") <(sort "${SAVED}") 2>/dev/null | sed -n '1,50p' | while IFS= read -r line; do
         logger -t safesetid-wrapper -p auth.warn "Datastore diff: ${line}"
       done
     fi
   else
-    # Could not persist, keep temp for inspection and log warning
-    logger -t safesetid-wrapper -p auth.warn "Datastore integrity mismatch detected; could not persist computed list ${CURRENT_TMP}; keeping it for inspection"
+    logger -t safesetid-wrapper -p auth.warn "Datastore mismatch; keeping ${CURRENT_TMP} for inspection"
     SAVED="${CURRENT_TMP}"
   fi
 
-  # Only attempt restore from the temp store if it exists or was successfully mounted
+  # Attempt restore from temp store
   if _ensure_tempdir && [ -d "${TEMP_STORE_DIR}" ]; then
-    logger -t safesetid-wrapper -p auth.notice "Attempting restore from temp store ${TEMP_STORE_DIR}."
+    logger -t safesetid-wrapper -p auth.notice "Attempting restore from ${TEMP_STORE_DIR}"
+    
     for src in "${TEMP_STORE_DIR}"/*; do
       [ -f "${src}" ] || continue
       dst="/var/lib/safesetid/$(basename "${src}")"
+      
       if ! cp -p -- "${src}" "${dst}" 2>/dev/null; then
-        logger -t safesetid-wrapper -p auth.err "Failed to restore ${dst} from ${src}"
+        logger -t safesetid-wrapper -p auth.err "Failed to restore ${dst}"
       else
         chmod 600 "${dst}" 2>/dev/null || true
         chown root:root "${dst}" 2>/dev/null || true
-        logger -t safesetid-wrapper -p auth.notice "Restored ${dst} from temp store"
+        logger -t safesetid-wrapper -p auth.notice "Restored ${dst}"
       fi
     done
 
     # Recompute and verify
     TMP2="$(mktemp)"
     _compute_tmp "${TMP2}"
+    
     if ! cmp -s "${DATA_HASH_FILE}" "${TMP2}"; then
       rm -f "${TMP2}"
-      logger -t safesetid-wrapper -p auth.warn "Datastore restore from temp did not fully reconcile the datastore"
-      # Note: keep the persisted SAVED file for debugging; it contains the computed snapshot that triggered the mismatch.
+      logger -t safesetid-wrapper -p auth.warn "Restore did not fully reconcile datastore"
     else
       rm -f "${TMP2}"
-      logger -t safesetid-wrapper -p auth.notice "Datastore successfully reconciled after restore from temp store"
+      logger -t safesetid-wrapper -p auth.notice "Datastore successfully reconciled"
     fi
   else
-    logger -t safesetid-wrapper -p auth.warn "Temp store ${TEMP_STORE_DIR} missing or not mountable; attempting fallback"
+    logger -t safesetid-wrapper -p auth.warn "Temp store unavailable; attempting fallback"
   fi
 else
-  # all good
   rm -f "${CURRENT_TMP}"
 fi
 
-# Now verify the main script integrity (as original)
+# Verify main script integrity
 if [ ! -f "${SCRIPT_HASH_FILE}" ] || [ ! -f "${TRUSTED_BACKUP}" ]; then
-  echo "CRITICAL: Script hash file or trusted backup not found. Cannot ensure script integrity." >&2
-  logger -t safesetid-wrapper -p auth.crit "Script hash or backup file not found. Halting."
+  logger -t safesetid-wrapper -p auth.crit "Script hash or backup missing"
+  exec 200>&-
   exit 1
 fi
 
-# If hash check fails, try to restore from trusted backup (same as before)
-if ! sha256sum -c --status "${SCRIPT_HASH_FILE}"; then
-  MSG="CRITICAL: Integrity check for ${MAIN_SCRIPT} failed! Attempting to self-heal by restoring the trusted backup."
+if ! sha256sum -c --status "${SCRIPT_HASH_FILE}" 2>/dev/null; then
+  MSG="CRITICAL: Integrity check failed! Attempting self-heal"
   echo "${MSG}" >&2
   logger -t safesetid-wrapper -p auth.crit "${MSG}"
+  
   if ! cp -p "${TRUSTED_BACKUP}" "${MAIN_SCRIPT}" 2>/dev/null; then
-    MSG_FAIL="FATAL: Self-healing failed. Could not restore ${MAIN_SCRIPT} from backup. MANUAL INTERVENTION REQUIRED."
+    MSG_FAIL="FATAL: Self-healing failed. MANUAL INTERVENTION REQUIRED."
     echo "${MSG_FAIL}" >&2
     logger -t safesetid-wrapper -p auth.crit "${MSG_FAIL}"
-    if command -v notify-send >/dev/null 2>&1; then
-      ( export DISPLAY=:0; export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"; notify-send -u critical "Security Alert: safesetid" "${MSG_FAIL}" || true ) &>/dev/null || true
-    fi
+    exec 200>&-
     exit 1
   fi
-  logger -t safesetid-wrapper -p auth.notice "Successfully restored ${MAIN_SCRIPT} from trusted backup."
+  
+  logger -t safesetid-wrapper -p auth.notice "Successfully restored ${MAIN_SCRIPT}"
 fi
 
-# Ensure the main script is readable by wrapper; if not readable, try to restore from backup
+# Ensure script is readable
 if [ ! -r "${MAIN_SCRIPT}" ]; then
-  logger -t safesetid-wrapper -p auth.warn "${MAIN_SCRIPT} not readable; attempting restore from ${TRUSTED_BACKUP}."
+  logger -t safesetid-wrapper -p auth.warn "${MAIN_SCRIPT} not readable; attempting restore"
+  
   if cp -p "${TRUSTED_BACKUP}" "${MAIN_SCRIPT}" 2>/dev/null; then
     chown root:root "${MAIN_SCRIPT}" 2>/dev/null || true
     chmod 0755 "${MAIN_SCRIPT}" 2>/dev/null || true
-    logger -t safesetid-wrapper -p auth.notice "Restored and fixed perms for ${MAIN_SCRIPT}."
+    logger -t safesetid-wrapper -p auth.notice "Restored and fixed perms"
   else
-    echo "FATAL: ${MAIN_SCRIPT} not readable and restore failed. Manual intervention required." >&2
+    echo "FATAL: ${MAIN_SCRIPT} not readable and restore failed." >&2
+    exec 200>&-
     exit 1
   fi
 fi
 
-# If file exists and is not executable, do NOT fail — prefer to exec via interpreter.
-# But also try to repair permissions so future runs are smooth:
+# Try to ensure executable bit (non-fatal)
 if [ ! -x "${MAIN_SCRIPT}" ]; then
-  logger -t safesetid-wrapper -p auth.notice "${MAIN_SCRIPT} not executable; attempting to set +x."
-  chmod 0755 "${MAIN_SCRIPT}" 2>/dev/null || logger -t safesetid-wrapper -p auth.warn "Failed to chmod +x ${MAIN_SCRIPT}; will exec via /bin/bash if readable."
+  logger -t safesetid-wrapper -p auth.notice "${MAIN_SCRIPT} not executable; attempting chmod"
+  chmod 0755 "${MAIN_SCRIPT}" 2>/dev/null || \
+    logger -t safesetid-wrapper -p auth.warn "Failed to chmod +x; will exec via /bin/bash"
 fi
 
-# Finally execute the main script. Use interpreter directly to avoid relying on the exec bit.
-# Using exec /bin/bash means we succeed even if +x is missing, provided the file is readable.
+# Release wrapper lock before exec
+exec 200>&-
+
+# Finally execute the main script
 exec /bin/bash "${MAIN_SCRIPT}" "$@"
 WRAPPER_EOF
 
-	chmod 0755 "${WRAPPER_SCRIPT_PATH}"
-	chown root:root "${WRAPPER_SCRIPT_PATH}"
-	_log info "Wrapper script created successfully."
+    chmod 0755 "${WRAPPER_SCRIPT_PATH}"
+    chown root:root "${WRAPPER_SCRIPT_PATH}"
+    _log info "Wrapper script created successfully."
 }
 
 # Create the restore helper script (small, minimal, used by systemd path unit)
@@ -1892,24 +2046,61 @@ install_script() {
     chmod 0755 "${MAIN_SCRIPT_PATH}"
     chown root:root "${MAIN_SCRIPT_PATH}" || true
 
-    # Optionally make wrapper, helper and backups immutable if chattr is available
+    # FIX: Remove immutable from meta-files (cleanup from old installations)
     if command -v chattr >/dev/null 2>&1; then
-        _log info "Setting immutable bit on trusted backups, helper and wrapper (chattr +i) to harden against accidental deletion. Root can still remove this."
-        # set +i if already set (no-op) then +i
-        for f in "${RESTORE_HELPER}" "${WRAPPER_SCRIPT_PATH}" "${WRAPPER_TRUSTED_BACKUP}" "${TRUSTED_SCRIPT_BACKUP}" "${BACKUP_DIR}/safesetid-restore-wrapper.bak"; do
-            if [ -f "${f}" ]; then
-                # try to remove immutability first to avoid errors on some filesystems
-                chattr -i "${f}" 2>/dev/null || true
-                chattr +i "${f}" 2>/dev/null || _log warning "WARN: chattr +i failed for ${f}"
+        _log info "Removing immutable flags from meta-files (cleanup from old installation)..."
+        for meta in "${META_UID}" "${META_GID}" "${META_UID_CONFIG}" "${META_GID_CONFIG}"; do
+            if [ -f "${meta}" ]; then
+                chattr -i "${meta}" 2>/dev/null || true
+                _log info "Cleaned up: ${meta}"
             fi
         done
     fi
 
-    # Create wrapper restore systemd units and enable them (done in install_service)
-    _log info "Creating the systemd units and enabling services..."
-    install_service	
-    install_monitor
-    install_file_monitor
+    # Optionally make wrapper, helper and backups immutable if chattr is available
+    if command -v chattr >/dev/null 2>&1; then
+        _log info "Setting immutable bit on trusted backups, helper and wrapper (chattr +i) to harden against accidental deletion. Root can still remove this."
+        
+        # Files to protect (expanded list)
+        local protected_files=(
+            # Scripts and helpers
+            "${RESTORE_HELPER}"
+            "${WRAPPER_SCRIPT_PATH}"
+            "${WRAPPER_TRUSTED_BACKUP}"
+            "${TRUSTED_SCRIPT_BACKUP}"
+            "${BACKUP_DIR}/safesetid-restore-wrapper.bak"
+            
+            # Canonical allowlists and configs
+            "${CANON_UID}"
+            "${CANON_GID}"
+            "${CANON_UID_CONFIG}"
+            "${CANON_GID_CONFIG}"
+            
+            # Backups and datastore
+            "${UID_BACKUP}"
+            "${GID_BACKUP}"
+            "${DATASTORE_HASH_FILE}"
+            "${CANON_SCRIPT_HASH_FILE}"
+            
+        )
+        
+        for f in "${protected_files[@]}"; do
+            if [ -f "${f}" ]; then
+                # Try to remove immutability first to avoid errors on some filesystems
+                chattr -i "${f}" 2>/dev/null || true
+                # Set immutable
+                if chattr +i "${f}" 2>/dev/null; then
+                    _log info "Protected: ${f}"
+                else
+                    _log warning "WARN: chattr +i failed for ${f}"
+                fi
+            fi
+        done
+    fi
+    
+	install_service
+	install_monitor
+	install_file_monitor
 
 cat <<EOF
 
@@ -1937,19 +2128,19 @@ EOF
 
 uninstall_script() {
 
-	# Advanced security check: Prevent direct execution by a root shell.
-	# The command must be invoked via a privilege escalation tool like 'sudo' or 'doas'
-	# by a logged-in, non-root user. This acts as a "two-man rule" against an attacker
-	# who has already gained a root shell.
-	local user="${SUDO_USER:-${DOAS_USER:-}}"
+    # Advanced security check: Prevent direct execution by a root shell.
+    # The command must be invoked via a privilege escalation tool like 'sudo' or 'doas'
+    # by a logged-in, non-root user. This acts as a "two-man rule" against an attacker
+    # who has already gained a root shell.
+    local user="${SUDO_USER:-${DOAS_USER:-}}"
 
-	if [ -z "${user}" ] || [ "${user}" = "root" ]; then
-		_log err "SECURITY: Direct root execution of 'uninstall_script' is forbidden."
-		_log err "Please run this command as a regular user via 'sudo' or 'doas'."
-		return 1
-	fi
+    if [ -z "${user}" ] || [ "${user}" = "root" ]; then
+        _log err "SECURITY: Direct root execution of 'uninstall_script' is forbidden."
+        _log err "Please run this command as a regular user via 'sudo' or 'doas'."
+        return 1
+    fi
 
-	# Load uninstall token from BACKUP_DIR
+    # Load uninstall token from BACKUP_DIR
     local stored_token
     if [ -r "${BACKUP_DIR}/.uninstall_token" ]; then
         stored_token="$(tr -d '\n\r' < "${BACKUP_DIR}/.uninstall_token" 2>/dev/null || printf '')"
@@ -1994,45 +2185,84 @@ uninstall_script() {
         return 1
     fi
 
-    # Interaktive Bestätigung bleibt bestehen
- 	# Interactive confirmation to prevent accidental uninstallation.
- 	local response
-	read -r -p "This will permanently remove safesetid and all its components. Are you absolutely sure? [y/N] " response
-	if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-		_log info "Uninstall cancelled."
-		exit 0
-	fi
+    # Interactive confirmation to prevent accidental uninstallation.
+     local response
+    read -r -p "This will permanently remove safesetid and all its components. Are you absolutely sure? [y/N] " response
+    if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        _log info "Uninstall cancelled."
+        return 0
+    fi
 
-	# Try to remove immutable bit if present (so deletion is possible)
-	if command -v chattr >/dev/null 2>&1; then
-		for f in "${WRAPPER_SCRIPT_PATH}" "${WRAPPER_TRUSTED_BACKUP}" "${TRUSTED_SCRIPT_BACKUP}" "${RESTORE_HELPER}" "${BACKUP_DIR}/safesetid-restore-wrapper.bak"; do
-			if [ -e "${f}" ]; then
-				chattr -i "${f}" 2>/dev/null || true
-			fi
-		done
-	fi
+    # FIX: Remove immutable bit from ALL protected files before deletion
+    if command -v chattr >/dev/null 2>&1; then
+        _log info "Removing immutable flags from all protected files..."
+        
+        # All files that might be immutable (same list as in install_script)
+        local protected_files=(
+            # Scripts and helpers
+            "${RESTORE_HELPER}"
+            "${WRAPPER_SCRIPT_PATH}"
+            "${WRAPPER_TRUSTED_BACKUP}"
+            "${TRUSTED_SCRIPT_BACKUP}"
+            "${BACKUP_DIR}/safesetid-restore-wrapper.bak"
+            
+            # Canonical allowlists and configs
+            "${CANON_UID}"
+            "${CANON_GID}"
+            "${CANON_UID_CONFIG}"
+            "${CANON_GID_CONFIG}"
+            
+            # Backups and datastore
+            "${UID_BACKUP}"
+            "${GID_BACKUP}"
+            "${DATASTORE_HASH_FILE}"
+            "${CANON_SCRIPT_HASH_FILE}"
+            
+            # Meta files
+            #"${META_UID}"
+            #"${META_GID}"
+            #"${META_UID_CONFIG}"
+            #"${META_GID_CONFIG}"
+        )
+        
+        for f in "${protected_files[@]}"; do
+            if [ -e "${f}" ]; then
+                chattr -i "${f}" 2>/dev/null || true
+            fi
+        done
+        
+        # Catch-all: remove immutable from entire backup dir (in case we missed any)
+        _log info "Removing immutable flags from backup directory..."
+        find "${BACKUP_DIR}" -type f -exec chattr -i {} \; 2>/dev/null || true
+    fi
 
-	# remove services and mounts and data
-	uninstall_file_monitor
-	uninstall_monitor
-	uninstall_service
+    # Remove services and mounts
+    _log info "Uninstalling systemd units..."
+    uninstall_file_monitor
+    uninstall_monitor
+    uninstall_service
 
-	# Try to unmount tmpfs temp store if mounted
-	if mountpoint -q "${TEMP_STORE_DIR}"; then
-		umount "${TEMP_STORE_DIR}" 2>/dev/null || true
-	fi
+    # Try to unmount tmpfs temp store if mounted
+    if mountpoint -q "${TEMP_STORE_DIR}" 2>/dev/null; then
+        _log info "Unmounting tmpfs at ${TEMP_STORE_DIR}..."
+        umount "${TEMP_STORE_DIR}" 2>/dev/null || true
+    fi
 
-	# remove temp dir
-	rm -rf "${TEMP_STORE_DIR}" 2>/dev/null || true
+    # Remove temp dir
+    _log info "Removing temporary directory..."
+    rm -rf "${TEMP_STORE_DIR}" 2>/dev/null || true
 
-	# remove binaries
-	rm -f "${MAIN_SCRIPT_PATH}"
-	rm -f "${WRAPPER_SCRIPT_PATH}"
-	rm -f "${RESTORE_HELPER}"
-	rm -fr "${CONFIG_DIR}"
-	rm -fr "${BACKUP_DIR}"
+    # Remove binaries
+    _log info "Removing binaries and configuration..."
+    rm -f "${MAIN_SCRIPT_PATH}" 2>/dev/null || true
+    rm -f "${WRAPPER_SCRIPT_PATH}" 2>/dev/null || true
+    rm -f "${RESTORE_HELPER}" 2>/dev/null || true
+    
+    # Remove config and backup directories
+    rm -rf "${CONFIG_DIR}" 2>/dev/null || true
+    rm -rf "${BACKUP_DIR}" 2>/dev/null || true
 
-	_log info "Script, wrapper, and all related data have been removed."
+    _log info "Uninstallation complete. Script, wrapper, and all related data have been removed."
 }
 
 install_service() {
